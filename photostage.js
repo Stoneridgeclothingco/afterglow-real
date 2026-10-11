@@ -41,6 +41,12 @@
     return out;
   }
 
+  // water surface at this exact time from the forecast wind / gusts / waves (Model.seaAt); phase keeps the waves moving with the slider
+  function seaP(spot, ev, t) {
+    if (spot.water === false) return { chop: 0, swell: 0, caps: 0, phase: 0, sea: null };
+    const W = (g.Model.seaAt && g.Model.seaAt(ev, t)) || g.Model.seaState({ wind: ev.s.wind || 0, gust: ev.s.gust || 0 }, 0.5);
+    return { chop: W.chop, swell: W.swell, caps: W.caps, phase: (t % 86400) / 420, sea: W };
+  }
   function params(spot, ev, t, opt = {}) {
     const pos = g.Model.sunPos(t, spot.lat, spot.lng), s = ev.s;
     const off = ((pos.az - ev.sunsetAz + 540) % 360) - 180;
@@ -57,6 +63,7 @@
       shore: spot.water !== false && spot.obst >= 0.5 ? clamp(spot.obst / 2, 0.25, 1) : 0,
       hills: spot.water === false ? 1 : 0,
       camH: spot.type === "Summit" ? 0.47 : spot.type === "Bluff" ? 0.025 : spot.type === "Dunes" ? 0.03 : 0.0025,
+      ...seaP(spot, ev, t),
       seed, wind: seed * 6.283, dog: ev.dog && ev.dog.p >= 15 && pos.elev > 0.3 && pos.elev < 15 ? clamp(ev.dog.p / 60) : 0,
     }, opt);
   }
@@ -93,7 +100,8 @@
     if (P.low > 0.2) c.push(P.low > 0.8 ? "overcast low stratocumulus cloud deck" : "low stratocumulus clouds");
     if (P.block > 0.45) c.push("a dark cloud bank along the western horizon");
     if (!c.length) c.push("a clear cloudless sky with a smooth color gradient");
-    const scene = P.water ? (P.pier ? "calm water with the silhouette of a long wooden fishing pier" : spot.type === "Harbor" ? "a calm harbor with a distant low shoreline" : "calm open water to the horizon") : spot.type === "Summit" ? "layered distant mountain ridges from a summit" : "a coastal landscape";
+    const wDesc = P.sea ? (P.sea.eff < 3 ? "glassy mirror-calm water" : P.sea.eff < 7 ? "calm rippled water" : P.sea.eff < 11 ? "lightly rippled water" : P.sea.eff < 16 ? "choppy water with scattered whitecaps" : "rough wind-whipped water with many whitecaps") : "calm water";
+    const scene = P.water ? (P.pier ? `${wDesc} with the silhouette of a long wooden fishing pier` : spot.type === "Harbor" ? `a harbor with ${wDesc} and a distant low shoreline` : `${wDesc} out to the horizon`) : spot.type === "Summit" ? "layered distant mountain ridges from a summit" : "a coastal landscape";
     const air = P.aod > 0.3 ? "hazy air, softened colors" : P.aod < 0.12 ? "crisp clean air, saturated colors" : "";
     return `a real photograph of a ${phaseFor(P.elev)} over ${scene}, ${c.join(", ")}${air ? ", " + air : ""}, natural colors, landscape photography, shot on a full-frame DSLR, 24mm, sharp, highly detailed, realistic`;
   }

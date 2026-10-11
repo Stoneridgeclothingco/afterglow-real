@@ -33,6 +33,10 @@ uniform float uPixScale;
 uniform float uTwi;
 uniform float uMidH;    // mid-deck base km (HRRR cloud base / GOES cloud-top height), default 4.5
 uniform float uBlockGap; // 0..1 clear slot on the far horizon toward the sun (from the 120/200 km path forecast)
+uniform float uChop;    // water surface roughness from forecast wind/gusts: 0 glassy mirror .. 1 rough
+uniform float uSwell;   // swell / wave height 0..1 (marine forecast, exposure-weighted)
+uniform float uCaps;    // whitecap coverage 0..1
+uniform float uPhase;   // wave motion phase (advances with the slider / Play)
 
 const float PI = 3.14159265;
 const float R0 = 6360.0;
@@ -354,19 +358,23 @@ void main(){
     // wave slope field (metres): long swell + chop, band-limited
     float e = .15;
     e = .04;
-    vec2 ws = vec2(.35, 1.4);
-    float h0 = fbm(wp*ws, fpW*ws.y, 7);
-    float hx = fbm((wp+vec2(e,0.))*ws, fpW*ws.y, 7);
-    float hz = fbm((wp+vec2(0.,e))*ws, fpW*ws.y, 7);
-    float amp = .07;
+    vec2 ws = vec2(.35, 1.4) * mix(.8, 1.25, uChop);
+    vec2 wm = wp + vec2(uPhase * .35, uPhase * 1.1);          // wind sea drifts toward the viewer
+    float h0 = fbm(wm*ws, fpW*ws.y, 7);
+    float hx = fbm((wm+vec2(e,0.))*ws, fpW*ws.y, 7);
+    float hz = fbm((wm+vec2(0.,e))*ws, fpW*ws.y, 7);
+    float amp = mix(.004, .17, pow(uChop, .85));              // glassy → choppy
     vec3 n = normalize(vec3(-(hx-h0)/e*amp, 1., -(hz-h0)/e*amp*.6));
+    // swell: long rolling crests (wave height from the marine forecast) — tilts the whole reflection in broad bands
+    float sk = .16 + .05*sin(wp.x*.013);
+    n = normalize(n + vec3(0., 0., uSwell * .22 * cos(wp.y * sk + wp.x * .02 + uPhase * 2.2)) * smoothstep(3000., 300., tW));
     float far = smoothstep(150., 2500., tW);
     // ripples that survive at distance: anchored to world x and inverse distance (perspective-compressed streaks)
     vec2 rq = vec2(wp.x / tW * 55. + uSeed.x, 900. / tW + uSeed.y);
     float fq = max(fwidth(rq.x), fwidth(rq.y)) * 1.5;
     float rp = fbm(rq, fq, 5) - .5;
     float rp2 = fbm(rq * vec2(3., 2.7) + 11., fq*3., 4) - .5;
-    n = normalize(n + vec3(rp2*.03, 0., (rp*.11 + rp2*.05)) * (.4 + .6*far));
+    n = normalize(n + vec3(rp2*.03, 0., (rp*.11 + rp2*.05)) * (.4 + .6*far) * mix(.06, 1.7, uChop));
     vec3 rr = reflect(rd, n); rr.y = max(rr.y, .002); rr = normalize(rr);
     float tPr; float pr = uPier > 0. ? pierHit(pw*vec3(1,0,1) + vec3(0,-2.0+.0,0)*0. + vec3(0,-2.,0)*-0., rr, tPr) : 0.;
     vec3 Tr; vec3 refl = skyRay(ro, rr, pixA*2., false, Tr);
@@ -375,18 +383,30 @@ void main(){
     float sunUp = smoothstep(-.006, .004, sa.y);
     vec3 hv = normalize(-rd + sa);
     float nh = max(dot(n, hv), 0.);
-    float m = .045 + .05*far;
+    float m = mix(.007, .06, uChop) + mix(.012, .07, uChop)*far;   // mirror-sharp sun reflection when slick, wide glitter when rough
     float c2 = max(nh*nh, 1e-3); float D = min(exp((c2-1.)/(c2*m*m)) / (PI*m*m*c2*c2), 400.);
     float cosI = max(dot(-rd, n), .01);
     float F = .02 + .98*pow(1.-cosI, 5.);
     float Fs = .02 + .98*pow(1.-max(dot(-rd, hv),0.), 5.);
     vec3 glit = sunUp > 0. ? ESUN * sunT(ro, sa) * sunVis * sunUp * D * Fs / (4.*cosI) * .9 : vec3(0.);
-    if (pr > .5) { refl = refl*.03; glit *= 0.; }
+    if (pr > .5) { refl = refl * mix(.03, .45, smoothstep(.3, .9, uChop) * (.5 + .5*abs(rp))); glit *= 1. - uChop; }   // rough water smears the pier's reflection
     vec3 body = vec3(.002,.006,.008) * (ESUN * .02) * (sunT(ro + vec3(0,20,0), uSun).g*.8 + .05);
     col = refl * F * 1.0 + glit + body * (1.-F);
+    col *= mix(1., .5 + .5*smoothstep(.32, .62, h0), uChop * .75 * (1. - .6*far));   // wind chop: shadowed wave backs break up the mirror
     // aerial perspective over the water
     vec3 Ta; vec3 hzS = skyRay(ro, normalize(vec3(rd.x, .001, rd.z)), pixA, false, Ta);
     float fog = 1. - exp(-tW*.001 * (BMe*1.3 + BR.g*1.) );
+    // whitecaps: breaking crests lit by the sky (no data → no foam; coverage from the forecast wind)
+    if (uCaps > .01){
+      // breaking crests in world space (metres); where they shrink below a pixel they fade into an average whitening
+      vec2 fq2 = wp * vec2(.22, .55) + vec2(uPhase * .3, uPhase * 1.) + uSeed * .013;
+      float fn = fbm(fq2, 0., 5) * .8 + fbm(fq2 * 2.3 + 5., 0., 3) * .3;
+      float thr = mix(.76, .62, uCaps);
+      float ww = smoothstep(.6, 2.5, fpW * .55);
+      float foam = mix(smoothstep(thr, thr + .06, fn), uCaps * .2, ww) * (.5 + .5*uCaps);
+      vec3 fc = hzS * .6 + refl * .2; fc = mix(vec3(dot(fc, vec3(.2126,.7152,.0722))), fc, .4) * 1.35;   // foam is white: desaturated sky light
+      col = mix(col, fc, clamp(foam, 0., .92));
+    }
     col = mix(col, hzS * .9, clamp(fog, 0., 1.));
     col = max(col, vec3(0.)); if (any(isnan(col))) col = hzS*.3;
   } else {
@@ -485,6 +505,7 @@ void main(){
     gl.uniform1f(U.uLQ, P.lq ? 1 : 0); gl.uniform1f(U.uDog, P.dog || 0); gl.uniform1f(U.uPixScale, 1);
     gl.uniform1f(U.uTwi, Math.max(0, Math.min(1, (1.5 - P.elev) / 3)) * Math.max(0, Math.min(1, (P.elev + 8) / 3))); gl.uniform1f(U.uGrainT, P.grain || 0.37);
     gl.uniform1f(U.uBlockGap, P.gap || 0);
+    gl.uniform1f(U.uChop, P.chop != null ? P.chop : 0.3); gl.uniform1f(U.uSwell, P.swell || 0); gl.uniform1f(U.uCaps, P.caps || 0); gl.uniform1f(U.uPhase, P.phase || 0);
     gl.uniform1f(U.uMidH, clamp(P.midKm || 4.5, 2.5, 7.5));
     gl.uniform1f(U.uMeter, 0);
     const ovc = clamp((Math.max(P.mid, P.low, P.high * 0.6) - 0.5) / 0.45);
@@ -498,7 +519,7 @@ void main(){
   // the way a photographer exposes a sunset (protect highlights, keep saturation). Blended with a twilight curve.
   const mcache = {};
   function meter(gl, U, w, h, P) {
-    const key = [P.elev, P.high, P.mid, P.low, P.block, P.aod, P.seed, P.water, P.pier, P.midKm || 4.5, P.gap || 0].map(v => typeof v === "number" ? v.toFixed(3) : v).join("|") + "|" + (w / h).toFixed(2);
+    const key = [P.elev, P.high, P.mid, P.low, P.block, P.aod, P.seed, P.water, P.pier, P.midKm || 4.5, P.gap || 0, Math.round((P.chop || 0) * 5)].map(v => typeof v === "number" ? v.toFixed(3) : v).join("|") + "|" + (w / h).toFixed(2);
     if (mcache[key]) return mcache[key];
     const mw = 64, mh = Math.max(24, Math.round(64 * h / w));
     gl.viewport(0, 0, mw, mh); gl.uniform2f(U.uRes, mw, mh); gl.uniform1f(U.uMeter, 1); gl.uniform1f(U.uLQ, 0); gl.uniform1f(U.uPixScale, w / mw);
