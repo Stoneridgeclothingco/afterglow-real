@@ -60,8 +60,10 @@
       high: C.high, mid: C.mid, low: C.low, midKm: C.midKm, gap: C.gap, cloudSrc: C.src,
       block: clamp(ev.slotBlock || 0), aod: clamp(aod, 0.02, 1.2), rh: (ev.rhLow || 60) / 100,
       water: spot.water !== false, pier: spot.type === "Pier" || spot.type === "Boardwalk",
-      shore: spot.water !== false && spot.obst >= 0.5 ? clamp(spot.obst / 2, 0.25, 1) : 0,
-      hills: spot.water === false ? 1 : 0,
+      // horizon features from the geography table (spots.js SCENE) for the direction you face
+      shore: spot.water !== false ? ({ open: 0, lowshore: 0.45, islands: 0.6, skyline: 0.35, bridge: 0.3, trees: 0.8, town: 0.6, hills: 0.4 }[spot.far] ?? (spot.obst >= 0.5 ? clamp(spot.obst / 2, 0.25, 1) : 0)) : 0,
+      hills: spot.water === false ? 1 : spot.far === "hills" ? 0.7 : 0,
+      city: spot.far === "skyline" ? 1 : 0, bridge: spot.far === "bridge" ? 1 : 0,
       camH: spot.type === "Summit" ? 0.47 : spot.type === "Bluff" ? 0.025 : spot.type === "Dunes" ? 0.03 : 0.0025,
       ...seaP(spot, ev, t),
       seed, wind: seed * 6.283, dog: ev.dog && ev.dog.p >= 15 && pos.elev > 0.3 && pos.elev < 15 ? clamp(ev.dog.p / 60) : 0,

@@ -21,6 +21,7 @@ uniform float uAod;     // aerosol optical depth (550 nm)
 uniform float uRH;      // low-level relative humidity 0..1
 uniform float uExpo;
 uniform float uWater, uPier, uShore, uHills;
+uniform float uCity, uBridge;
 uniform float uCamH;    // camera height km
 uniform float uPitch, uFov;
 uniform vec2 uSeed;
@@ -317,11 +318,28 @@ void main(){
     prof = max(prof, dip + (.004 + n*.022) * uHills);
   }
 
+  // city skyline across the water (blocky buildings in a band of azimuths) and a long low bridge (deck + piers + span)
+  if (uCity > 0.){
+    float b = floor(az*140. + uSeed.x*7.);
+    float hgt = fract(sin(b*12.9898 + uSeed.y)*43758.5453);
+    float band = smoothstep(-.42, -.25, az) * (1. - smoothstep(.2, .38, az));
+    prof = max(prof, dip + band * (.0015 + pow(hgt, 2.2)*.016) * uCity);
+  }
+  bool span = false;
+  if (uBridge > 0.){
+    float inB = step(-.5, az) * step(az, .45);
+    float deck = dip + .0042 + .004*exp(-pow((az - .05)/.08, 2.));
+    if (inB > .5 && abs(elevR - deck) < .0007) span = true;
+    if (inB > .5 && elevR < deck && elevR > dip && fract(az*70.) < .1) span = true;
+  }
   float tP; float pier = uPier > 0. ? pierHit(vec3(0.,0.,0.), rd, tP) : 0.;
 
   if (pier > .5){
     vec3 Tt; vec3 sk = skyRay(ro, normalize(vec3(rd.x, .02, rd.z)), pixA, false, Tt);
     col = sk * .03 + vec3(.0006,.0005,.0008);
+  } else if (span){
+    vec3 Ta; vec3 hzS = skyRay(ro, normalize(vec3(rd.x, dip + .004, rd.z)), pixA, false, Ta);
+    col = mix(vec3(.0012,.0011,.0014) * (ESUN*.05), hzS*.45, .35 + .5*clamp(uAod*3.,0.,1.));
   } else if (elevR > prof && elevR > dip + .0002){
     col = skyRay(ro, rd, pixA, uLQ < .5, T);
     // sun disc (limb darkened, flattened by refraction near the horizon)
@@ -497,7 +515,7 @@ void main(){
     gl.uniform3f(U.uCov, P.high, P.mid, P.low);
     gl.uniform1f(U.uBlock, P.block); gl.uniform1f(U.uAod, P.aod); gl.uniform1f(U.uRH, P.rh);
 
-    gl.uniform1f(U.uWater, P.water ? 1 : 0); gl.uniform1f(U.uPier, P.pier ? 1 : 0); gl.uniform1f(U.uShore, P.shore || 0); gl.uniform1f(U.uHills, P.hills || 0);
+    gl.uniform1f(U.uWater, P.water ? 1 : 0); gl.uniform1f(U.uPier, P.pier ? 1 : 0); gl.uniform1f(U.uShore, P.shore || 0); gl.uniform1f(U.uHills, P.hills || 0); if (U.uCity) gl.uniform1f(U.uCity, P.city || 0); if (U.uBridge) gl.uniform1f(U.uBridge, P.bridge || 0);
     gl.uniform1f(U.uCamH, P.camH || 0.002);
     const aspect = W / H, vfov = aspect < 1 ? 62 : aspect < 1.5 ? 50 : 40;
     gl.uniform1f(U.uFov, vfov * d2r); gl.uniform1f(U.uPitch, (vfov * 0.17) * d2r);
@@ -519,7 +537,7 @@ void main(){
   // the way a photographer exposes a sunset (protect highlights, keep saturation). Blended with a twilight curve.
   const mcache = {};
   function meter(gl, U, w, h, P) {
-    const key = [P.elev, P.high, P.mid, P.low, P.block, P.aod, P.seed, P.water, P.pier, P.midKm || 4.5, P.gap || 0, Math.round((P.chop || 0) * 5)].map(v => typeof v === "number" ? v.toFixed(3) : v).join("|") + "|" + (w / h).toFixed(2);
+    const key = [P.elev, P.high, P.mid, P.low, P.block, P.aod, P.seed, P.water, P.pier, P.shore || 0, P.city || 0, P.bridge || 0, P.midKm || 4.5, P.gap || 0, Math.round((P.chop || 0) * 5)].map(v => typeof v === "number" ? v.toFixed(3) : v).join("|") + "|" + (w / h).toFixed(2);
     if (mcache[key]) return mcache[key];
     const mw = 64, mh = Math.max(24, Math.round(64 * h / w));
     gl.viewport(0, 0, mw, mh); gl.uniform2f(U.uRes, mw, mh); gl.uniform1f(U.uMeter, 1); gl.uniform1f(U.uLQ, 0); gl.uniform1f(U.uPixScale, w / mw);
