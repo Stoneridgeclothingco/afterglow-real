@@ -10,6 +10,37 @@
   const CANVAS_ONLY = !REAL;
   const live = () => !CANVAS_ONLY && g.Photoreal && g.Photoreal.supported();
 
+  // Cloud layers at the exact slider time: HRRR hours (NOAA direct, interpolated) fused with GOES-19 observed cloud now.
+  // Rule: if the satellite/model says there is cloud at this spot/time, the render must show it (never thinner than the data).
+  function cloudsAt(spot, ev, t) {
+    const s = ev.s, N = g.AGNoaa, out = { high: (s.high || 0) / 100, mid: (s.mid || 0) / 100, low: (s.low || 0) / 100, midKm: 4.5, gap: 0, src: "model@event" };
+    if (!N) return out;
+    const H = N.hrrr && N.hrrr.hours ? Object.keys(N.hrrr.hours).map(Number).sort((a, b) => a - b) : [];
+    const pick = id => { let a = null, b = null; for (const k of H) { const x = N.hrrr.hours[k][id]; if (!x) continue; if (k <= t) a = [k, x]; if (k >= t && !b) b = [k, x]; }
+      if (!a && !b) return null; if (!a || !b || a[0] === b[0]) return (a || b)[0] && Math.abs((a || b)[0] - t) < 5400 ? (a || b)[1] : null;
+      const f = (t - a[0]) / (b[0] - a[0]), L = k => a[1][k] == null || b[1][k] == null ? (a[1][k] ?? b[1][k]) : a[1][k] + (b[1][k] - a[1][k]) * f;
+      return { high: L("high"), mid: L("mid"), low: L("low"), cbase_m: L("cbase_m") }; };
+    const hs = pick(spot.id);
+    if (hs) { out.high = (hs.high || 0) / 100; out.mid = (hs.mid || 0) / 100; out.low = (hs.low || 0) / 100; out.src = "HRRR@t";
+      if (hs.cbase_m && hs.cbase_m > 2500 && hs.cbase_m < 8000 && out.mid > 0.3 && out.low < 0.3) out.midKm = hs.cbase_m / 1000; }
+    // far horizon toward the sun: open slot if the 120/200 km points are clear of low/mid cloud
+    const far = [120, 200].map(km => pick(`${spot.id}@${km}`)).filter(Boolean);
+    if (far.length) out.gap = clamp(1 - Math.max(...far.map(x => Math.max(x.low || 0, (x.mid || 0) * 0.85))) / 100);
+    // GOES-19 observed now (today only): weight fades over ~4 h from the scan time
+    const G = N.goes && N.goes.points && N.goes.points[spot.id], scan = N.goes && N.goes.products && (N.goes.products.ACM || N.goes.products.CTH);
+    const today = !g.AGDay || g.AGDay() === 0;
+    if (G && scan && today && G.cloud_frac != null) {
+      const w = clamp(1 - Math.abs(t - Date.parse(scan.scan_utc) / 1000) / (4 * 3600)), cf = G.cloud_frac * w;
+      const tot = G.obs_low + G.obs_mid + G.obs_high || 1;
+      out.low = Math.max(out.low, cf * G.obs_low / tot); out.mid = Math.max(out.mid, cf * G.obs_mid / tot); out.high = Math.max(out.high, cf * G.obs_high / tot);
+      if (w > 0.2) out.src += "+GOES";
+      if (G.cth_km_med && G.obs_mid / tot > 0.5 && !(hs && hs.cbase_m)) out.midKm = clamp(G.cth_km_med - 1.5, 3, 7);
+      const fg = N.goes.points[`${spot.id}@120`]; if (fg && fg.cloud_frac != null) out.gap = Math.min(out.gap || 1, clamp(1 - fg.cloud_frac * w - (1 - w) * (1 - (out.gap || 0))));
+    }
+    out.high = clamp(out.high); out.mid = clamp(out.mid); out.low = clamp(out.low);
+    return out;
+  }
+
   function params(spot, ev, t, opt = {}) {
     const pos = g.Model.sunPos(t, spot.lat, spot.lng), s = ev.s;
     const off = ((pos.az - ev.sunsetAz + 540) % 360) - 180;
@@ -17,9 +48,10 @@
     let aod = s.aod != null ? s.aod : 0.05 + (1 - ev.clean) * 0.45;
     aod *= 1 + Math.max(0, (ev.rhLow || 60) - 70) / 50;
     const seed = (g.Photoreal ? g.Photoreal.hash : () => 0.5)(spot.id + ":" + ev.tSet);
+    const C = cloudsAt(spot, ev, t);
     return Object.assign({
       elev: pos.elev, sunAzOff: clamp(off + 3, -14, 14),
-      high: clamp((s.high || 0) / 100), mid: clamp((s.mid || 0) / 100), low: clamp((s.low || 0) / 100),
+      high: C.high, mid: C.mid, low: C.low, midKm: C.midKm, gap: C.gap, cloudSrc: C.src,
       block: clamp(ev.slotBlock || 0), aod: clamp(aod, 0.02, 1.2), rh: (ev.rhLow || 60) / 100,
       water: spot.water !== false, pier: spot.type === "Pier" || spot.type === "Boardwalk",
       shore: spot.water !== false && spot.obst >= 0.5 ? clamp(spot.obst / 2, 0.25, 1) : 0,
@@ -57,8 +89,8 @@
   function prompt(spot, ev, P) {
     const c = [];
     if (P.high > 0.12) c.push(P.high > 0.6 ? "a thin veil of cirrostratus with cirrus streaks" : "wispy cirrus streaks high in the sky");
-    if (P.mid > 0.12) c.push(P.mid > 0.6 ? "a broad altocumulus cloud deck" : "scattered altocumulus clouds");
-    if (P.low > 0.2) c.push("low stratocumulus clouds");
+    if (P.mid > 0.12) c.push(P.mid > 0.85 ? "sky fully covered by a textured altocumulus / altostratus cloud deck" : P.mid > 0.6 ? "a broad altocumulus cloud deck" : "scattered altocumulus clouds");
+    if (P.low > 0.2) c.push(P.low > 0.8 ? "overcast low stratocumulus cloud deck" : "low stratocumulus clouds");
     if (P.block > 0.45) c.push("a dark cloud bank along the western horizon");
     if (!c.length) c.push("a clear cloudless sky with a smooth color gradient");
     const scene = P.water ? (P.pier ? "calm water with the silhouette of a long wooden fishing pier" : spot.type === "Harbor" ? "a calm harbor with a distant low shoreline" : "calm open water to the horizon") : spot.type === "Summit" ? "layered distant mountain ridges from a summit" : "a coastal landscape";
@@ -115,5 +147,5 @@
     if (a && b) { if (a === b) return [[a.url, 1]]; const w = (t - a.t) / (b.t - a.t), s = w * w * (3 - 2 * w); return [[a.url, 1], [b.url, clamp((s - 0.2) / 0.6)]]; }
     const f = a || b; return Math.abs(f.t - t) < 150 ? [[f.url, 1]] : null;
   }
-  g.PhotoStage = { realistic: REAL, draw, params, prompt, apiOK, ensurePhotos, photoMix, photoSet, keyTimes, live };
+  g.PhotoStage = { realistic: REAL, draw, params, cloudsAt, prompt, apiOK, ensurePhotos, photoMix, photoSet, keyTimes, live };
 })(window);

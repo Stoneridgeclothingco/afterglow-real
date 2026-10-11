@@ -1,6 +1,17 @@
 (function () {
+  // Mode: ?mode=sunrise | ?mode=sunset. No mode → the "Welcome to Afterglow" homepage (index.html) handles the choice.
+  const MODE = new URLSearchParams(location.search).get("mode");
+  if (MODE !== "sunrise" && MODE !== "sunset") return;
+  const RISE = MODE === "sunrise";
+  window.AG_MODE = MODE;
+  document.body.classList.add("mode-" + MODE);
+  const EV = RISE ? "sunrise" : "sunset", Ev = RISE ? "Sunrise" : "Sunset", DIRW = RISE ? "East" : "West", dirw = RISE ? "east" : "west";
   const { evaluate, label, likely, offset, sunPos } = window.Model;
-  const SPOTS = window.SPOTS;
+  // Same spots in both modes; sunrise swaps in each spot's EAST-facing view (arc / obstruction / water / note).
+  const SPOTS = RISE ? window.SPOTS.map(sp => { const v = (window.SUNRISE_VIEW || {})[sp.id] || [60, 150, 2, false, ""]; return Object.assign({}, sp, { arc: [v[0], v[1]], obst: v[2], water: v[3], note: v[4] || sp.note, setNote: sp.note }); }) : window.SPOTS;
+  const PLAY = RISE ? "▶ Play the morning" : "▶ Play the evening";
+  // phase names from the canvas preview are sunset-worded; mirror them for mornings
+  const phaseName = p => !RISE ? p : ({ "Sunset": "Sunrise", "Afterglow": "First color", "Blue hour": "Blue hour (dawn)" }[p] || p);
   const REGIONS = {
     all: { name: "All coast", states: null },
     ne: { name: "New England", states: ["ME", "NH", "MA", "RI", "NY"] },
@@ -8,9 +19,7 @@
     se: { name: "Carolinas & GA", states: ["NC", "SC", "GA"] },
     fl: { name: "Florida", states: ["FL"] },
   };
-  const AG = window.AG || {}, RISE = !!AG.rise;
-  const state = { day: RISE ? 1 : 0, region: "all", spot: null, data: null, results: [], userLoc: null, overlay: "none" };
-  window.__agState = state;
+  const state = window.__agState = { day: 0, region: "all", spot: null, data: null, results: [], userLoc: null, overlay: "none" };
   const $ = s => document.querySelector(s);
   const API = "https://api.open-meteo.com/v1/forecast";
   const SPOT_VARS = "cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,relative_humidity_2m,dew_point_2m,temperature_2m,visibility,wind_speed_10m,wind_direction_10m,wind_gusts_10m,precipitation,precipitation_probability,weather_code,cape,pressure_msl,relative_humidity_850hPa,relative_humidity_500hPa,relative_humidity_300hPa";
@@ -21,13 +30,16 @@
   const nowT = Date.now() / 1000;
   SPOTS.forEach(sp => {
     // azimuth at approx local sunset today: search for elevation crossing
-    let t = Math.floor(nowT / 86400) * 86400 + 12 * 3600, az = 270;
-    if (RISE) { t = Math.floor(nowT / 86400) * 86400 + 6 * 3600; az = 90; for (let k = 1; k < 160; k++) { const p = sunPos(t + k * 300, sp.lat, sp.lng); if (p.elev > 0) { az = p.az; break; } } }
-    else for (let k = 0; k < 160; k++) { const p = sunPos(t + k * 300, sp.lat, sp.lng); if (p.elev < 0 && k > 0) { az = p.az; break; } }
+    let t = Math.floor(nowT / 86400) * 86400 + (RISE ? 5 : 12) * 3600, az = RISE ? 90 : 270;
+    for (let k = 0; k < 160; k++) { const p = sunPos(t + k * 300, sp.lat, sp.lng); if (RISE ? (p.elev > 0 && k > 0) : (p.elev < 0 && k > 0)) { az = p.az; break; } }
     sp.az = az; sp.west = offset(sp.lat, sp.lng, az, 80); sp.path = [40, 120, 200].map(km => offset(sp.lat, sp.lng, az, km)); sp.east = offset(sp.lat, sp.lng, (az + 180) % 360, 12);
   });
 
-  async function fetchBatch(points, hourly, daily, base = API, models) {
+  // Open-Meteo free tier: 600 weighted calls/min, 5000/hour per IP. One mode load is ~300 weighted calls
+  // (47 spots + 141 path points + AQ), so we share spot data across modes, cache longer, back off on errors,
+  // and never dead-end: stale cache -> best-match -> baked NOAA snapshot shipped with the site.
+  const sleep = ms => new Promise(res => setTimeout(res, ms));
+  async function fetchBatch(points, hourly, daily, base = API, models, tries = 3) {
     const p = new URLSearchParams({
       latitude: points.map(x => x.lat).join(","), longitude: points.map(x => x.lng).join(","),
       hourly, timezone: "auto", timeformat: "unixtime", forecast_days: "7",
@@ -36,36 +48,67 @@
     if (daily) p.set("daily", daily);
     if (models) p.set("models", models);
     if (base !== API) ["temperature_unit", "wind_speed_unit", "precipitation_unit"].forEach(k => p.delete(k));
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const r = await fetch(`${base}?${p}`);
-      if (r.ok) { const j = await r.json(); return Array.isArray(j) ? j : [j]; }
-      await new Promise(res => setTimeout(res, 800 * (attempt + 1)));
+    let last = null;
+    for (let attempt = 0; attempt < tries; attempt++) {
+      try {
+        const ctl = new AbortController(), to = setTimeout(() => ctl.abort(), 12000);   // Open-Meteo sometimes never answers
+        try {
+          const r = await fetch(`${base}?${p}`, { signal: ctl.signal });
+          if (r.ok) { const j = await r.json(); return Array.isArray(j) ? j : [j]; }
+          last = new Error("Open-Meteo HTTP " + r.status); last.status = r.status;
+          if (r.status === 429) break;                     // rate-limited: retrying only burns more quota
+        } finally { clearTimeout(to); }
+      } catch (e) { last = e; }                            // network / CORS-less 429 / timeout
+      if (attempt < tries - 1) await sleep(1200 * (attempt + 1));
     }
-    throw new Error("Open-Meteo request failed");
+    throw last || new Error("Open-Meteo request failed");
   }
+  const lsGet = k => { try { return JSON.parse(localStorage.getItem(k) || "null"); } catch (e) { return null; } };
+  const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { try { Object.keys(localStorage).filter(x => x.startsWith("afterglow-v")).forEach(x => localStorage.removeItem(x)); localStorage.setItem(k, JSON.stringify(v)); } catch (e2) {} } };
+  const FRESH = 45 * 60 * 1000, STALE_OK = 12 * 3600 * 1000;
 
   async function loadData() {
     // Cache is keyed to the exact spot list: adding/reordering spots must never reuse old index-aligned arrays.
-    const sig = SPOTS.map(s => s.id).join("|");
-    Object.keys(localStorage).filter(k => k.startsWith("afterglow-v") && k !== "afterglow-v13" && k !== "afterglow-v13-rise").forEach(k => { try { localStorage.removeItem(k); } catch (e) {} });
-    const key = RISE ? "afterglow-v13-rise" : "afterglow-v13";   // sunrise samples the path toward the sunrise azimuth
-    let cached = null; try { cached = JSON.parse(localStorage.getItem(key) || "null"); } catch (e) {}
-    if (cached && cached.sig === sig && cached.S && cached.S.length === SPOTS.length && cached.W && cached.W.length === SPOTS.length * 3 && cached.E && cached.E.length === SPOTS.length && Date.now() - cached.at < 30 * 60 * 1000) return cached;
+    const sig = SPOTS.map(s => s.id).join("|"), n = SPOTS.length;
+    const BK = "afterglow-v15-base", DK = "afterglow-v15-" + MODE;
+    Object.keys(localStorage).filter(k => k.startsWith("afterglow-v") && !k.startsWith("afterglow-v15-")).forEach(k => { try { localStorage.removeItem(k); } catch (e) {} });
+    const okB = c => c && c.sig === sig && c.S && c.S.length === n;
+    const okD = c => c && c.sig === sig && c.W && c.W.length === n * 3 && c.E && c.E.length === n;
+    let B = lsGet(BK), D = lsGet(DK);
+    const fresh = c => c && Date.now() - c.at < FRESH;
+    const join = (b, dd, extra) => Object.assign({ at: Math.min(b.at, dd.at), sig, S: b.S, AQ: b.AQ, fcModel: b.fcModel, W: dd.W, E: dd.E }, extra || {});
+    if (okB(B) && okD(D) && fresh(B) && fresh(D)) return join(B, D);
     // Primary: NOAA HRRR (0–48 h, 3 km) blended into NOAA GFS (days 3–7) — Open-Meteo "gfs_seamless" mirror of NOAA NOMADS output.
-    // Fallback (clearly labelled): Open-Meteo best-match, which may use non-NOAA models.
-    const get = models => Promise.all([
-      fetchBatch(SPOTS, SPOT_VARS, "sunset,sunrise", API, models),
-      fetchBatch(SPOTS.flatMap(s => s.path), WEST_VARS, null, API, models),
-      fetchBatch(SPOTS.map(s => s.east), EAST_VARS, null, API, models),
-    ]);
-    let S, W, E, fcModel = "noaa";
-    try { [S, W, E] = await get("gfs_seamless"); } catch (e) { console.warn("NOAA HRRR/GFS mirror failed, using fallback", e); [S, W, E] = await get(null); fcModel = "fallback"; }
-    // Air quality (aerosol optical depth, PM2.5) — optional; score falls back to visibility only
-    let AQ = null;
-    try { AQ = await fetchBatch(SPOTS, "aerosol_optical_depth,pm2_5,dust", null, "https://air-quality-api.open-meteo.com/v1/air-quality"); } catch (e) { console.warn("AQ unavailable", e); }
-    const d = { at: Date.now(), sig, S, W, E, AQ, fcModel };
-    try { localStorage.setItem(key, JSON.stringify(d)); } catch (e) {}
-    return d;
+    const getB = async models => {
+      const S = await fetchBatch(SPOTS, SPOT_VARS, "sunset,sunrise", API, models);
+      let AQ = null; try { AQ = await fetchBatch(SPOTS, "aerosol_optical_depth,pm2_5,dust", null, "https://air-quality-api.open-meteo.com/v1/air-quality", null, 1); } catch (e) { console.warn("AQ unavailable", e); }
+      return { at: Date.now(), sig, S, AQ, fcModel: models ? "noaa" : "fallback" };
+    };
+    const getD = async models => { const [W, E] = await Promise.all([fetchBatch(SPOTS.flatMap(s => s.path), WEST_VARS, null, API, models), fetchBatch(SPOTS.map(s => s.east), EAST_VARS, null, API, models)]); return { at: Date.now(), sig, W, E }; };
+    const tryLive = async models => {
+      const [b, dd] = await Promise.all([okB(B) && fresh(B) ? B : getB(models), okD(D) && fresh(D) ? D : getD(models)]);
+      if (b !== B) lsSet(BK, b); if (dd !== D) lsSet(DK, dd);
+      return join(b, dd);
+    };
+    let err;
+    // Live budget: if Open-Meteo hasn't answered in 10 s, show cached/snapshot data now; the live fetch keeps going and refreshes the cache.
+    const live = tryLive("gfs_seamless");
+    try { return await Promise.race([live, sleep(10000).then(() => { const e = new Error("Open-Meteo too slow"); e.slow = true; throw e; })]); }
+    catch (e) { err = e; console.warn("NOAA HRRR/GFS mirror failed/slow", e); live.catch(() => {}); }
+    // 1) recent cache (even if past the 45-min refresh window)
+    if (okB(B) && okD(D) && Date.now() - Math.min(B.at, D.at) < STALE_OK) return join(B, D, { stale: true });
+    // 2) Open-Meteo best-match (skip if we were rate-limited — it hits the same quota)
+    if (!(err && (err.status === 429 || err.slow))) { try { return Object.assign(await tryLive(null), {}); } catch (e) { console.warn("best-match fallback failed", e); } }
+    // 3) NOAA snapshot baked into the site at deploy time
+    try {
+      const v = Math.floor(Date.now() / 600000);
+      const [sb, sd] = await Promise.all(["base", MODE].map(x => fetch(`data/snap-${x}.json?_=${v}`).then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })));
+      if (okB(sb) && okD(sd)) return join(sb, sd, { snapshot: true });
+      console.warn("snapshot does not match spot list");
+    } catch (e) { console.warn("snapshot unavailable", e); }
+    // 4) any cache at all
+    if (okB(B) && okD(D)) return join(B, D, { stale: true });
+    throw err;
   }
 
 
@@ -87,19 +130,19 @@
         const h = d.S[i].hourly; let ok = false;
         ok = setH(h, "cloud_cover_low", t, x.low) | setH(h, "cloud_cover_mid", t, x.mid) | setH(h, "cloud_cover_high", t, x.high) | setH(h, "cloud_cover", t, x.total);
         setH(h, "visibility", t, x.vis_m); setH(h, "relative_humidity_2m", t, x.rh2m); setH(h, "precipitation", t, x.prate_mmh);
-        [40, 120, 200].forEach((km, k) => { const y = pts[`${sp.id}@${km}`], w = d.W[i * 3 + k] && d.W[i * 3 + k].hourly; if (y && w) { setH(w, "cloud_cover_low", t, y.low); setH(w, "cloud_cover_mid", t, y.mid); setH(w, "cloud_cover_high", t, y.high); setH(w, "precipitation", t, y.prate_mmh); } });
+        if (!RISE) [40, 120, 200].forEach((km, k) => { const y = pts[`${sp.id}@${km}`], w = d.W[i * 3 + k] && d.W[i * 3 + k].hourly; if (y && w) { setH(w, "cloud_cover_low", t, y.low); setH(w, "cloud_cover_mid", t, y.mid); setH(w, "cloud_cover_high", t, y.high); setH(w, "precipitation", t, y.prate_mmh); } });
         if (ok) P.hrrrHours.push(+t);
       }
       // GOES-19 ABI AOD (observed today) → tonight's haze input
       let g = N.goes && N.goes.points && N.goes.points[sp.id], aodWhere = "at the spot";
       if (g && (g.aod == null || (g.aod_n || 0) < 5)) {   // cloud over the spot: use nearest clear-pixel retrievals along the sunset line
-        const alt = [40, 120, 200].map(km => [km, N.goes.points[`${sp.id}@${km}`]]).filter(([, x]) => x && x.aod != null && x.aod_n >= 5);
-        if (alt.length) { g = { aod: alt[0][1].aod, aod_n: alt[0][1].aod_n }; aodWhere = `${alt[0][0]} km toward sunset (spot cloud-covered)`; } else g = null;
+        const alt = RISE ? [] : [40, 120, 200].map(km => [km, N.goes.points[`${sp.id}@${km}`]]).filter(([, x]) => x && x.aod != null && x.aod_n >= 5);
+        if (alt.length) { g = { aod: alt[0][1].aod, aod_n: alt[0][1].aod_n }; aodWhere = `${alt[0][0]} km toward ${EV} (spot cloud-covered)`; } else g = null;
       }
       if (g && g.aod != null && (g.aod_n || 0) >= 5) {
         if (!d.AQ) d.AQ = [];
         if (!d.AQ[i]) d.AQ[i] = { hourly: { time: d.S[i].hourly.time.slice(), aerosol_optical_depth: d.S[i].hourly.time.map(() => null), pm2_5: d.S[i].hourly.time.map(() => null), dust: d.S[i].hourly.time.map(() => null) } };
-        const ah = d.AQ[i].hourly, t0 = d.S[i].daily.sunset[0];
+        const ah = d.AQ[i].hourly, t0 = d.S[i].daily[EV][0];
         ah.time.forEach((t, k) => { if (Math.abs(t - t0) <= 3 * 3600) ah.aerosol_optical_depth[k] = g.aod; });
         P.goesAod = { v: g.aod, t0, where: aodWhere };
       }
@@ -136,6 +179,56 @@
   const confidence = i => i === 0 ? { t: "Higher confidence", c: "hi" } : i <= 2 ? { t: "Moderate confidence", c: "md" } : { t: "Low confidence (day " + (i + 1) + ")", c: "lo" };
   const dist = (a, b) => { const R = 3958.8, dLat = (b.lat - a.lat) * Math.PI / 180, dLng = (b.lng - a.lng) * Math.PI / 180; const x = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * Math.PI / 180) * Math.cos(b.lat * Math.PI / 180) * Math.sin(dLng / 2) ** 2; return 2 * R * Math.asin(Math.sqrt(x)); };
 
+  // ---------- Bonus: rainbows & sun dogs ----------
+  const BONUS_MIN = 10;   // below this the odds are "near zero" → greyed / hidden
+  const bonusCls = p => p >= 40 ? "hi" : p >= 22 ? "md" : p >= BONUS_MIN ? "lo" : "no";
+  const bonusWord = p => p >= BONUS_MIN ? likely(p) : "Near zero";
+  const durTxt = m => m >= 60 ? (m / 60).toFixed(m % 60 ? 1 : 0).replace(/\.0$/, "") + " h" : m + " min";
+  const hm = (t, tz) => fmtTime(t, tz).replace(/ [A-Z]{2,4}$/, "");
+  function bonusCard(b, r, opts = {}) {
+    const c = bonusCls(b.p), when = b.p >= BONUS_MIN && b.t ? fmtTime(b.t, r.tz) : null;
+    return `<div class="bcard ${b.id} ${c}${b.red ? " red" : ""}"${opts.spot ? ` data-id="${r.spot.id}"` : ""}>
+      <div class="bc-ic">${b.icon}</div>
+      <div class="bc-main"><div class="bc-k">${opts.kicker || "Bonus"}</div><div class="bc-n">${b.name}${opts.spot ? ` <small>· ${r.spot.name}, ${r.spot.state}</small>` : ""}</div>
+      <div class="bc-why">${opts.short ? (b.p >= BONUS_MIN ? (b.win ? `Starts ${hm(b.win.start, r.tz)} · lasts ~${durTxt(b.win.min)} · look ${b.look.split(",")[0]}` : `Look ${b.look}${when ? " ~" + when : ""}`) : (b.id === "bow" ? `Too little rain opposite the sun — rainbow odds near zero everywhere` : "Not enough thin ice cloud near a low sun — sun-dog odds near zero everywhere")) : b.why + (when ? ` <em>Best ~${when}</em>` : "")}</div></div>
+      ${!opts.short && b.win && b.p >= BONUS_MIN ? `<div class="bc-win"><div><span>Starts</span><b>${hm(b.win.start, r.tz)}</b></div><div><span>Lasts</span><b>~${durTxt(b.win.min)}</b></div><div><span>Ends</span><b>${hm(b.win.end, r.tz)}</b></div><div><span>Look</span><b>${b.look.split(",")[0]}</b></div></div>` : ""}
+      <div class="bc-p"><b>${b.p}%</b><span>${bonusWord(b.p)}</span></div>
+      <div class="bc-bar"><i style="width:${Math.max(2, b.p)}%"></i></div></div>`;
+  }
+  function renderBonus(list) {
+    const box = $("#bonus"); if (!box) return;
+    const best = id => list.slice().sort((a, b) => b.ev.bonus[id].p - a.ev.bonus[id].p)[0];
+    const bw = best("bow"), dg = best("dog"); if (!bw) { box.innerHTML = ""; return; }
+    const nb = list.filter(r => r.ev.bonus.bow.p >= BONUS_MIN).length, nd = list.filter(r => r.ev.bonus.dog.p >= BONUS_MIN).length;
+    box.innerHTML = `<div class="bonus-h">✨ Special bonus · ${state.day === 0 ? (RISE ? "this morning" : "tonight") : state.day === 1 ? (RISE ? "tomorrow morning" : "tomorrow night") : fmtDay(list[0].ev.tSet, list[0].tz, state.day)}<small>${nb} spot${nb === 1 ? "" : "s"} with rainbow odds · ${nd} with sun dogs</small></div>
+      ${bonusCard(bw.ev.bonus.bow, bw, { spot: true, short: true, kicker: "Best rainbow odds" })}
+      ${bonusCard(dg.ev.bonus.dog, dg, { spot: true, short: true, kicker: "Best sun-dog odds" })}
+      ${(() => { const tri = list.filter(r => r.ev.tri.on); if (tri.length) return tri.slice(0, 3).map(r => trifectaCard(r, { spot: true })).join("");
+        const c = list.slice().sort((a, b) => (b.ev.tri.n - a.ev.tri.n) || ((b.ev.score / EP.color + b.ev.tri.bow / EP.bow + b.ev.tri.bolt / EP.bolt) - (a.ev.score / EP.color + a.ev.tri.bow / EP.bow + a.ev.tri.bolt / EP.bolt)))[0];
+        return trifectaCard(c, { spot: true }); })()}`;
+    box.querySelectorAll(".bcard[data-id],.tricard[data-id]").forEach(el => el.addEventListener("click", () => openDetail(el.dataset.id)));
+  }
+
+  // ---------- Weather during the event + Trifecta ----------
+  // Little icons under each map pin: 🌈 rainbow odds ≥ 10% (bold at ≥ 22%), ⚡ lightning odds ≥ 25% in the event window,
+  // then rain / wind / fog / overcast / snow if forecast during the window.
+  function pinIcons(r) {
+    const B = r.ev.bonus, out = [];
+    if (B.bow.p >= BONUS_MIN) out.push({ i: "🌈", c: "bow " + bonusCls(B.bow.p), t: `Rainbow ${B.bow.p}%` });
+    r.ev.wx.items.forEach(w => out.push({ i: w.icon, c: w.id + (w.id === "bolt" && w.p >= 40 ? " hi" : ""), t: w.name }));
+    return out.slice(0, 3);
+  }
+  const wxChip = w => `<span class="tag wx ${w.id}">${w.icon} ${w.name}${w.p ? " " + w.p + "%" : ""}</span>`;
+  const EP = window.Model.EPIC;
+  const legTxt = T => `${T.legs.color ? "✓" : "✗"} ${Ev} ${T.color}/${EP.color} · ${T.legs.bow ? "✓" : "✗"} Rainbow ${T.bow}%/${EP.bow}% · ${T.legs.bolt ? "✓" : "✗"} Lightning ${T.bolt}%/${EP.bolt}%`;
+  function trifectaCard(r, opts = {}) {
+    const T = r.ev.tri;
+    if (T.on) return `<div class="tricard on"${opts.spot ? ` data-id="${r.spot.id}"` : ""}><div class="tri-ic">✦</div><div><div class="tri-k">Trifecta${opts.spot ? ` · ${r.spot.name}, ${r.spot.state}` : ""}</div>
+      <div class="tri-n">Epic ${EV} + epic rainbow + epic lightning</div><div class="tri-w">${hm(T.start, r.tz)}–${hm(T.end, r.tz)} · ${legTxt(T)}</div></div><div class="tri-badge">🌅🌈⚡</div></div>`;
+    return `<div class="tricard"${opts.spot ? ` data-id="${r.spot.id}"` : ""}><div class="tri-ic off">✦</div><div><div class="tri-k">Trifecta watch${opts.spot ? ` · closest: ${r.spot.name}, ${r.spot.state}` : ""}</div>
+      <div class="tri-n">${T.n}/3 epic${T.n === 3 && !T.lined ? " — but rainbow & lightning don't overlap in time" : ""}</div><div class="tri-w">${legTxt(T)}</div></div></div>`;
+  }
+
   // ---------- Map ----------
   const map = L.map("map", { zoomControl: false, attributionControl: true, minZoom: 4 }).setView([34.5, -77.5], 5);
   L.control.zoom({ position: "bottomright" }).addTo(map);
@@ -159,13 +252,16 @@
   function renderMarkers() {
     state.results.forEach(r => {
       const lb = label(r.ev.score);
-      const html = `<div class="pin" style="--c:${lb.c}"><span>${r.ev.score}</span></div>`;
+      const B = r.ev.bonus, T = r.ev.tri, ic = pinIcons(r);
+      const bx = B.dog.p >= 22 ? `<em class="pb dog">◉</em>` : "";
+      const html = `<div class="pin${T.on ? " tri" : ""}" style="--c:${lb.c}"><span>${r.ev.score}</span>${bx}${T.on ? `<em class="ptri" title="Trifecta">✦</em>` : ""}${ic.length ? `<div class="pwx">${ic.map(x => `<i class="${x.c}" title="${x.t}">${x.i}</i>`).join("")}</div>` : ""}</div>`;
       const icon = L.divIcon({ className: "pin-wrap", html, iconSize: [30, 30], iconAnchor: [15, 15] });
       if (markers[r.spot.id]) markers[r.spot.id].setIcon(icon);
       else markers[r.spot.id] = L.marker([r.spot.lat, r.spot.lng], { icon, riseOnHover: true }).addTo(map)
         .on("click", () => openDetail(r.spot.id))
         .bindTooltip("", { direction: "top", offset: [0, -16], className: "tip" });
-      markers[r.spot.id].setTooltipContent(`<b>${r.spot.name}</b><br>${lb.t} · ${fmtTime(r.ev.tSet, r.tz)}`);
+      markers[r.spot.id].setTooltipContent(`<b>${r.spot.name}</b><br>${lb.t} · ${fmtTime(r.ev.tSet, r.tz)}${r.ev.bonus.bow.p >= BONUS_MIN ? `<br>🌈 ${r.ev.bonus.bow.name} ${r.ev.bonus.bow.p}%` : ""}${r.ev.bonus.dog.p >= BONUS_MIN ? `<br>◉ Sun dogs ${r.ev.bonus.dog.p}%` : ""}${r.ev.wx.items.map(w => `<br>${w.icon} ${w.name}${w.p ? " " + w.p + "%" : ""}`).join("")}${r.ev.tri.on ? `<br><b class="tt-tri">✦ TRIFECTA</b>` : ""}`);
+      if (markers[r.spot.id].setZIndexOffset) markers[r.spot.id].setZIndexOffset(r.ev.tri.on ? 1000 : ic.length ? 200 : 0);
     });
   }
 
@@ -197,8 +293,8 @@
     const b = list[0]; if (!b) return;
     const lb = label(b.ev.score), conf = confidence(state.day);
     $("#hero").innerHTML = `
-      <div class="hero-k">Best ${state.day === 0 ? "tonight" : "on " + fmtDay(b.ev.tSet, b.tz, state.day)} · ${REGIONS[state.region].name}</div>
-      <div class="hero-row"><div><div class="hero-name">${b.spot.name}</div><div class="hero-sub">${b.spot.state} · sunset ${fmtTime(b.ev.tSet, b.tz)}</div></div>
+      <div class="hero-k">Best ${state.day === 0 ? (RISE ? "this morning" : "tonight") : "on " + fmtDay(b.ev.tSet, b.tz, state.day)} · ${REGIONS[state.region].name}</div>
+      <div class="hero-row"><div><div class="hero-name">${b.spot.name}</div><div class="hero-sub">${b.spot.state} · ${EV} ${fmtTime(b.ev.tSet, b.tz)}</div></div>
       <div class="ring" style="--p:${b.ev.score};--c:${lb.c}"><b>${b.ev.score}</b><i>${lb.t}</i></div></div>
       <div class="hero-why">${b.ev.reasons[0]} Best minute ~${fmtTime(b.ev.timing.peak, b.tz)}.</div><div class="conf ${conf.c}">${conf.t}</div>`;
     $("#hero").onclick = () => openDetail(b.spot.id);
@@ -206,7 +302,10 @@
   function renderList(list) {
     $("#list").innerHTML = list.map((r, k) => {
       const lb = label(r.ev.score);
-      const tags = r.ev.badges.filter(b => b.p >= 22).sort((a, b) => b.p - a.p).slice(0, 3).map(b => `<span class="tag ${b.id}">${b.icon} ${b.name.toLowerCase()} ${likely(b.p).toLowerCase()}</span>`);
+      const B = r.ev.bonus, btag = [B.bow, B.dog].filter(b => b.p >= BONUS_MIN).map(b => `<span class="tag bonus ${b.id} ${bonusCls(b.p)}">${b.icon} ${b.name} ${b.p}%</span>`);
+      if (r.ev.tri.on) btag.unshift(`<span class="tag tri">✦ Trifecta</span>`);
+      r.ev.wx.items.slice(0, 2).forEach(w => btag.push(wxChip(w)));
+      const tags = btag.concat(r.ev.badges.filter(b => b.p >= 22 && b.id !== "bow" && b.id !== "dog").sort((a, b) => b.p - a.p).slice(0, Math.max(0, 4 - btag.length)).map(b => `<span class="tag ${b.id}">${b.icon} ${b.name.toLowerCase()} ${likely(b.p).toLowerCase()}</span>`));
       return `<li class="item" data-id="${r.spot.id}" style="--c:${lb.c};animation-delay:${k * 18}ms">
         <div class="rank">${k + 1}</div>
         <div class="meta"><div class="nm">${r.spot.name} <span class="st">${r.spot.state}</span></div>
@@ -221,28 +320,28 @@
     });
   }
   function update() {
-    compute(); renderDays(); const list = filtered(); renderHero(list); renderList(list); renderMarkers();
+    compute(); renderDays(); const list = filtered(); renderHero(list); renderBonus(list); renderList(list); renderMarkers();
     if (state.spot) openDetail(state.spot, true);
   }
 
   // ---------- Detail ----------
   function barRow(lbl, v) { v = Math.round(v ?? 0); return `<div class="brow"><span>${lbl}</span><div class="btrack"><i style="width:${v}%"></i></div><b>${v}%</b></div>`; }
   function timeline(r) {
-    const { S, W } = state.data, h = S[r.i].hourly, w = W[r.i * 3].hourly, t0 = r.ev.tSet - 4 * 3600, t1 = r.ev.tSet + 3600;
+    const { S, W } = state.data, h = S[r.i].hourly, w = W[r.i * 3].hourly, t0 = r.ev.tSet - (RISE ? 1 : 4) * 3600, t1 = r.ev.tSet + (RISE ? 4 : 1) * 3600;
     const idx = h.time.map((t, i) => [t, i]).filter(([t]) => t >= t0 - 1800 && t <= t1 + 1800);
     const cw = 100 / idx.length;
     const cols = idx.map(([t, i]) => {
       const lo = h.cloud_cover_low[i], md = h.cloud_cover_mid[i], hi = h.cloud_cover_high[i], wl = w.cloud_cover_low[i];
       const isSet = Math.abs(t - r.ev.tSet) < 1800;
       return `<div class="tcol ${isSet ? "set" : ""}" style="width:${cw}%">
-        <div class="tstack"><i class="hi" style="opacity:${hi / 100}"></i><i class="md" style="opacity:${md / 100}"></i><i class="lo" style="opacity:${lo / 100}"></i><i class="wl" style="opacity:${wl / 100}" title="West horizon low cloud"></i></div>
+        <div class="tstack"><i class="hi" style="opacity:${hi / 100}"></i><i class="md" style="opacity:${md / 100}"></i><i class="lo" style="opacity:${lo / 100}"></i><i class="wl" style="opacity:${wl / 100}" title="${DIRW} horizon low cloud"></i></div>
         <div class="tlab">${new Intl.DateTimeFormat("en-US", { hour: "numeric", timeZone: r.tz }).format(new Date(t * 1000)).replace(" ", "")}</div></div>`;
     }).join("");
-    return `<div class="timeline">${cols}</div><div class="tlegend"><span><i class="hi"></i>High</span><span><i class="md"></i>Mid</span><span><i class="lo"></i>Low overhead</span><span><i class="wl"></i>Low, 40 km toward sunset</span></div>`;
+    return `<div class="timeline">${cols}</div><div class="tlegend"><span><i class="hi"></i>High</span><span><i class="md"></i>Mid</span><span><i class="lo"></i>Low overhead</span><span><i class="wl"></i>Low, 40 km toward ${EV}</span></div>`;
   }
   // Sun elevation curve (§1.1) with timing markers
   function sunChart(r) {
-    const T = r.ev.timing, sp = r.spot, t0 = Math.min(T.golden || T.sunset - 3600, T.civilEnd || T.sunset + 1800) - (RISE ? 300 : 1200), t1 = Math.max(T.golden || T.sunset - 3600, T.civilEnd || T.sunset + 1800) + (RISE ? 1200 : 300);
+    const T = r.ev.timing, sp = r.spot, [t0, t1] = RISE ? [(T.civilEnd || T.sunset - 1800) - 300, (T.golden || T.sunset + 3600) + 1200] : [(T.golden || T.sunset - 3600) - 1200, (T.civilEnd || T.sunset + 1800) + 300];
     const W = 520, H = 130, eMin = -8, eMax = 10;
     const X = t => (t - t0) / (t1 - t0) * W, Y = el => H - (el - eMin) / (eMax - eMin) * H;
     let d = ""; for (let t = t0; t <= t1; t += 120) { const el = sunPos(t, sp.lat, sp.lng).elev; d += (d ? "L" : "M") + X(t).toFixed(1) + "," + Y(Math.max(eMin, Math.min(eMax, el))).toFixed(1); }
@@ -254,16 +353,16 @@
       <line x1="0" x2="${W}" y1="${Y(0)}" y2="${Y(0)}" stroke="#fff" opacity=".35"/>
       <line x1="0" x2="${W}" y1="${Y(-6)}" y2="${Y(-6)}" stroke="#7b5cff" opacity=".5" stroke-dasharray="2 4"/>
       <path d="${d}" fill="none" stroke="#ffd29a" stroke-width="2.5"/>
-      ${mk(T.golden, "#ffd29a", "golden hour", true)}${mk(T.sunset, "#ff7a3d", "sunset", false)}${mk(T.peak, "#ff4f9a", "peak", true)}${mk(T.glowEnd, "#c9b8ff", "glow ends", false)}
+      ${mk(T.golden, "#ffd29a", RISE ? "golden hour ends" : "golden hour", true)}${mk(T.sunset, "#ff7a3d", EV, false)}${mk(T.peak, "#ff4f9a", "peak", true)}${mk(T.glowEnd, "#c9b8ff", RISE ? "first color" : "glow ends", false)}
       <text x="4" y="${Y(0) - 3}" fill="#fff" opacity=".6" font-size="9">0° horizon</text><text x="4" y="${Y(-6) - 3}" fill="#b5a9ff" font-size="9">−6° civil twilight</text>
     </svg>`;
   }
   // ---------- Predicted-sunset stage + time scrubber ----------
-  function scrubRange(T) { const a = T.golden || T.sunset + (RISE ? 3600 : -3600), b = T.civilEnd || T.sunset + (RISE ? -1800 : 1800); return [Math.min(a, b) - 600, Math.max(a, b) + 600]; }
+  function scrubRange(T) { if (RISE) return [(T.civilEnd || T.sunset - 1800) - 600, (T.golden || T.sunset + 3600) + 600]; const t0 = (T.golden || T.sunset - 3600) - 600, t1 = (T.civilEnd || T.sunset + 1800) + 600; return [t0, t1]; }
   function stage(r) {
     const sp = r.spot, ev = r.ev, T = ev.timing, s = ev.s, lb = label(ev.score), [t0, t1] = scrubRange(T);
     const pct = t => ((t - t0) / (t1 - t0) * 100).toFixed(2);
-    const marks = [["golden", T.golden, "Golden hour", "Golden"], ["sunset", T.sunset, "Sunset", "Sunset"], ["peak", T.peak, "Best", "Best"], ["glow", T.glowEnd, RISE ? "Glow starts" : "Glow ends", RISE ? "Glow start" : "Glow end"], ["civil", T.civilEnd, RISE ? "Civil dawn" : "Twilight ends", RISE ? "Dawn" : "Dusk"]].filter(m => m[1]).sort((a, b) => a[1] - b[1]);
+    const marks = (RISE ? [["golden", T.golden, "Golden hour ends", "Golden"], ["sunset", T.sunset, "Sunrise", "Sunrise"], ["peak", T.peak, "Best", "Best"], ["glow", T.glowEnd, "First color", "1st color"], ["civil", T.civilEnd, "Civil dawn", "Dawn"]] : [["golden", T.golden, "Golden hour", "Golden"], ["sunset", T.sunset, "Sunset", "Sunset"], ["peak", T.peak, "Best", "Best"], ["glow", T.glowEnd, "Glow ends", "Glow end"], ["civil", T.civilEnd, "Twilight ends", "Dusk"]]).filter(m => m[1]).sort((a, b) => a[1] - b[1]);
     // merge markers that would overlap on the track (e.g. best minute ≈ glow ends)
     const merged = []; for (const m of marks) { const prev = merged[merged.length - 1]; if (prev && (m[1] - prev[1]) / (t1 - t0) < 0.07) { prev[2] += " · " + m[2]; prev[3] += "·" + m[3]; } else merged.push([...m]); }
     marks.length = 0; marks.push(...merged);
@@ -273,12 +372,10 @@
     if (nct) nct.forEach(c => types[c.level.toLowerCase()] = c.type.replace(/ \(.*/, "") + (c.type.includes("GOES") ? " ✓" : ""));
     const chip = (k, v, sub, p) => `<div class="rc"><span>${k} ${p ? tag(p) : ""}</span><b>${v}</b>${sub ? `<small>${sub}</small>` : ""}</div>`;
     // track colors: day gold → sunset orange → peak rose → glow violet → night
-    const tr = RISE
-      ? `linear-gradient(90deg,#0b0a1c 0%,#1d1b44 ${pct(T.civilEnd || t0)}%,#7b5cff ${pct(T.glowEnd || T.peak - 900)}%,#ff4f9a ${pct(T.peak)}%,#ff8a3d ${pct(T.sunset)}%,#ffd08a ${pct(T.golden || t1)}%,#8fb3d9 100%)`
-      : `linear-gradient(90deg,#8fb3d9 0%,#ffd08a ${pct(T.golden || t0)}%,#ff8a3d ${pct(T.sunset)}%,#ff4f9a ${pct(T.peak)}%,#7b5cff ${pct(T.glowEnd || T.peak + 900)}%,#1d1b44 ${pct(T.civilEnd || t1)}%,#0b0a1c 100%)`;
+    const tr = RISE ? `linear-gradient(90deg,#0b0a1c 0%,#1d1b44 ${pct(T.civilEnd || t0)}%,#7b5cff ${pct(T.glowEnd || T.peak - 900)}%,#ff4f9a ${pct(T.peak)}%,#ff8a3d ${pct(T.sunset)}%,#ffd08a ${pct(T.golden || t1)}%,#8fb3d9 100%)` : `linear-gradient(90deg,#8fb3d9 0%,#ffd08a ${pct(T.golden || t0)}%,#ff8a3d ${pct(T.sunset)}%,#ff4f9a ${pct(T.peak)}%,#7b5cff ${pct(T.glowEnd || T.peak + 900)}%,#1d1b44 ${pct(T.civilEnd || t1)}%,#0b0a1c 100%)`;
     return `
       <section class="stage" style="--c:${lb.c}">
-        <canvas id="pv" aria-label="Illustrated forecast of the sunset at ${sp.name}"></canvas>
+        <canvas id="pv" aria-label="Illustrated forecast of the ${EV} at ${sp.name}"></canvas>
         <img id="pv-ph0" class="pv-photo" alt=""><img id="pv-ph1" class="pv-photo" alt=""><canvas id="pv-wx" class="pv-wx" aria-hidden="true"></canvas><div id="pv-wxl" class="pv-wxl" hidden></div>
         <div class="stage-top">
           <div><div class="d-kick">${sp.type} · ${sp.state}${r.mi != null ? " · " + Math.round(r.mi) + " mi away" : ""} · ${fmtDay(ev.tSet, r.tz, state.day)} ${fmtDate(ev.tSet, r.tz)}</div><h2>${sp.name}</h2></div>
@@ -295,17 +392,17 @@
       </section>
       <div class="scrub" style="--track:${tr}">
         <div class="scrub-marks">${marks.map((m, k) => `<button data-t="${m[1]}" style="left:${pct(m[1])}%" class="mk ${m[0]} ${k % 2 ? "alt" : ""}"><i></i><span class="lf">${m[2]}</span><span class="ls">${m[3]}</span><em>${fmtTime(m[1], r.tz).replace(/ [A-Z]{2,4}$/, "")}</em></button>`).join("")}</div>
-        <input id="scrub" type="range" min="${t0}" max="${t1}" step="20" value="${T.peak}" aria-label="Time of evening">
-        <div class="scrub-row"><button id="pv-play" class="play">▶ Play the evening</button><span id="pv-what" class="pv-what"></span></div>
+        <input id="scrub" type="range" min="${t0}" max="${t1}" step="20" value="${T.peak}" aria-label="Time of ${RISE ? "morning" : "evening"}">
+        <div class="scrub-row"><button id="pv-play" class="play">${PLAY}</button><span id="pv-what" class="pv-what"></span></div>
       </div>
       <div class="readout">
         ${chip("High", Math.round(s.high) + "%", types.high || "", P.clouds)}
         ${chip("Mid", Math.round(s.mid) + "%", types.mid || "", P.clouds)}
         ${chip("Low", Math.round(s.low) + "%", types.low || "", P.clouds)}
-        ${chip("West gap", Math.round((1 - ev.slotBlock) * 100) + "% open", ev.slotBlock < 0.25 ? "light gets in" : ev.slotBlock < 0.55 ? "partly blocked" : "mostly blocked", P.path)}
+        ${chip(DIRW + " gap", Math.round((1 - ev.slotBlock) * 100) + "% open", ev.slotBlock < 0.25 ? "light gets in" : ev.slotBlock < 0.55 ? "partly blocked" : "mostly blocked", P.path)}
         ${chip("Air", hazeTxt, s.aod != null ? "AOD " + s.aod.toFixed(2) : "RH " + Math.round(ev.rhLow) + "%", P.aod)}
       </div>
-      <div class="fine pv-fine">${PhotoStage.live() ? "Realistic mode: a physically based sky render of this spot's forecast, optionally finished by an AI image model. It is a forecast visualization, not a real photo." : "This is an illustrated preview generated from this spot's forecast, not a photo."} Cloud cover by layer comes from NOAA HRRR (with the low-cloud gap along the sunset line), haze from NOAA GOES-19 AOD / CAMS, and the lighting follows the actual sun position. Drag the slider or hit Play to watch the colors change through golden hour, sunset, afterglow and blue hour.</div>
+      <div class="fine pv-fine">This is an illustrated preview generated from this spot's forecast, not a photo. Cloud cover by layer comes from NOAA HRRR (with the low-cloud gap along the ${EV} line), haze from NOAA GOES-19 AOD / CAMS, and the lighting follows the actual sun position. Drag the slider or hit Play to watch the colors change through ${RISE ? "blue hour, first color, sunrise and golden hour" : "golden hour, sunset, afterglow and blue hour"}. Weather is drawn only when the forecast calls for it during the ${EV} window: rain (slanted by the wind), ⚡ storm cell and lightning (odds ≥ 25%), whitecaps (wind ≥ 15 mph), fog and snow. Rainbows form opposite the sun — behind you — so when rainbow odds are ≥ 10% a 🌈 “behind you” panel appears during the forecast rainbow window.</div>
       ${noaaPanel(r)}`;
   }
 
@@ -323,27 +420,27 @@
     const f = (v, d = 0, u = "") => v == null || isNaN(v) ? "—" : (+v).toFixed(d) + u;
     const pct = v => v == null ? "—" : Math.round(v) + "%";
     const cyc = N.hrrr ? new Date(N.hrrr.cycle_utc).toISOString().slice(11, 13) + "Z" : "";
-    const hs = hrrrAt(sp.id, tSet), hp = [40, 120, 200].map(km => hrrrAt(`${sp.id}@${km}`, tSet));
-    const hrrrCard = hs ? `<div class="ncard"><div class="nh"><b>HRRR at sunset</b><span class="src model">NOAA model</span></div>
+    const hs = hrrrAt(sp.id, tSet), hp = [40, 120, 200].map(km => RISE ? null : hrrrAt(`${sp.id}@${km}`, tSet));
+    const hrrrCard = hs ? `<div class="ncard"><div class="nh"><b>HRRR at ${EV}</b><span class="src model">NOAA model</span></div>
       <div class="ngrid"><div><span>Low / Mid / High</span><b>${pct(hs.low)} / ${pct(hs.mid)} / ${pct(hs.high)}</b></div><div><span>Total cloud</span><b>${pct(hs.total)}</b></div>
       <div><span>Cloud base</span><b>${hs.cbase_m != null && hs.cbase_m < 20000 ? f(hs.cbase_m * 3.281 / 1000, 1, "k ft") : "—"}</b></div><div><span>Visibility</span><b>${f(hs.vis_m / 1609, 0, " mi")}</b></div>
       <div><span>RH 2 m</span><b>${pct(hs.rh2m)}</b></div><div><span>Rain rate</span><b>${f(hs.prate_mmh, 1, " mm/h")}</b></div>
       <div><span>Smoke near surface</span><b>${f(hs.smoke_sfc_ugm3, 1, " µg/m³")}</b></div><div><span>Smoke column</span><b>${f(hs.smoke_col_mgm2, 1, " mg/m²")}</b></div>
       <div><span>Smoke AOD (HRRR-Smoke)</span><b>${f(hs.aot, 3)}</b></div>
       <div><span>Low cloud toward sun</span><b>${hp.map(x => x ? pct(x.low) : "—").join(" · ")}</b></div></div>
-      <div class="fine">HRRR ${cyc} run, 3 km, read directly from NOAA's grib2 on AWS Open Data and interpolated to ${fmtTime(tSet, r.tz)}. Path = 40 / 120 / 200 km toward the sunset.</div></div>`
-      : `<div class="ncard"><div class="nh"><b>HRRR at sunset</b><span class="src model">NOAA model</span></div><div class="fine">${state.day > 1 ? "Beyond HRRR's 48-h range — this day uses NOAA GFS (via Open-Meteo mirror)." : "Direct HRRR hours not available for this sunset — using NOAA HRRR via Open-Meteo mirror."}</div></div>`;
-    const G = N.goes, gp = G && G.points[sp.id], gpath = G ? [40, 120, 200].map(km => G.points[`${sp.id}@${km}`] || {}) : [];
+      <div class="fine">HRRR ${cyc} run, 3 km, read directly from NOAA's grib2 on AWS Open Data and interpolated to ${fmtTime(tSet, r.tz)}. ${RISE ? "Sunrise path (east) clouds come from the NOAA HRRR/GFS mirror." : "Path = 40 / 120 / 200 km toward the sunset."}</div></div>`
+      : `<div class="ncard"><div class="nh"><b>HRRR at ${EV}</b><span class="src model">NOAA model</span></div><div class="fine">${state.day > 1 ? "Beyond HRRR's 48-h range — this day uses NOAA GFS (via Open-Meteo mirror)." : "Direct HRRR hours not available for this sunset — using NOAA HRRR via Open-Meteo mirror."}</div></div>`;
+    const G = N.goes, gp = G && G.points[sp.id], gpath = G && !RISE ? [40, 120, 200].map(km => G.points[`${sp.id}@${km}`] || {}) : [];
     const phase = g => { const p = g && g.phase; if (!p) return "clear"; const e = Object.entries(p).sort((a, b) => b[1] - a[1])[0]; return `${e[0]} ${Math.round(e[1] * 100)}%`; };
     const warn = [];
     if (G && state.day === 0) {
       const lowW = gpath.filter(g => g.low_stratus_fog).length;
-      if (lowW && hp.every(x => !x || x.low < 25)) warn.push(`GOES-19 currently sees low liquid cloud/fog along the sunset line (${lowW}/3 points) that HRRR clears by sunset — watch it.`);
+      if (lowW && hp.every(x => !x || x.low < 25)) warn.push(`GOES-19 currently sees low liquid cloud/fog along the ${EV} line (${lowW}/3 points) that HRRR clears by ${EV} — watch it.`);
       if (gp && gp.obs_high > 0.5 && (gp.phase || {}).ice > 0.5) warn.push(`GOES-19 confirms ice cloud overhead now (tops ${f(gp.cth_km_med, 1)} km) — real cirrus canvas.`);
     }
     const goesCard = G && gp ? `<div class="ncard"><div class="nh"><b>GOES-19 observed now</b><span class="src obs">NOAA obs</span></div>
       <table class="ntab"><tr><th></th><th>Cloud</th><th>Top</th><th>Phase</th><th>AOD</th></tr>
-      ${[["Here", gp], ...gpath.map((g, k) => [`${[40, 120, 200][k]} km W`, g])].map(([n, g]) => `<tr><td>${n}</td><td>${g.cloud_frac != null ? Math.round(g.cloud_frac * 100) + "%" : "—"}</td><td>${f(g.cth_km_med, 1, " km")}</td><td>${phase(g)}</td><td>${f(g.aod, 2)}</td></tr>`).join("")}</table>
+      ${[["Here", gp], ...gpath.map((g, k) => [`${[40, 120, 200][k]} km ${DIRW[0]}`, g])].map(([n, g]) => `<tr><td>${n}</td><td>${g.cloud_frac != null ? Math.round(g.cloud_frac * 100) + "%" : "—"}</td><td>${f(g.cth_km_med, 1, " km")}</td><td>${phase(g)}</td><td>${f(g.aod, 2)}</td></tr>`).join("")}</table>
       <div class="fine">ABI L2 CONUS products from NOAA Open Data (s3://noaa-goes19): clear-sky mask (ACM), cloud-top height (ACHA), cloud-top phase (ACTP), aerosol optical depth (AOD; daytime, clear pixels only). Scan ${fmtClock(G.products.ACM ? G.products.ACM.scan_utc : G.products.CTH.scan_utc)}. ${state.day === 0 ? "Tonight's haze score uses this AOD." : "Current observation — most useful for tonight."}</div></div>` : "";
     const M = N.metar && N.metar[sp.id];
     const metarCard = M ? `<div class="ncard"><div class="nh"><b>Surface obs · ${M.station}</b><span class="src obs">NOAA obs</span></div>
@@ -352,7 +449,7 @@
       <div><span>Cloud bases</span><b>${(M.clouds || []).map(c => `${c.cover}${c.base != null ? " " + (c.base / 1000).toFixed(1) + "k ft" : ""}`).join(", ") || "clear"}</b></div><div><span>Temp / dew</span><b>${f(M.temp_c * 9 / 5 + 32, 0, "°")} / ${f(M.dewp_c * 9 / 5 + 32, 0, "°F")}</b></div></div>
       <div class="fine mono">${M.raw}</div></div>` : `<div class="ncard"><div class="nh"><b>Surface obs</b><span class="src obs">NOAA obs</span></div><div class="fine">No METAR station within ~30 mi of this spot.</div></div>`;
     const P = provenance(r);
-    const prov = [["Cloud layers & western gap", P.clouds], ["Visibility / humidity", P.vis], ["Haze (AOD)", P.aod], ["PM2.5", P.pm], ["Cloud types", P.types], ["Front / pressure trend", P.front], ["Sun position & times", P.sun]];
+    const prov = [[`Cloud layers & ${dirw}ern gap`, P.clouds], ["Visibility / humidity", P.vis], ["Haze (AOD)", P.aod], ["PM2.5", P.pm], ["Cloud types", P.types], ["Front / pressure trend", P.front], ["Sun position & times", P.sun]];
     return `<h3>NOAA data <small>what drives this forecast</small></h3>
       ${warn.length ? `<div class="nwarn">${warn.map(w => `<div>🛰 ${w}</div>`).join("")}</div>` : ""}
       <div class="ncards">${hrrrCard}${goesCard}${metarCard}</div>
@@ -368,11 +465,11 @@
       const o = PhotoStage.draw(cv, sp, ev, t, { lq: dragging });
       showPhotos(t);
       if (dragging && o.mode === "live") { clearTimeout(hqT); hqT = setTimeout(() => { dragging = false; queue(); }, 160); }
-      wxT = t; wxC = window.Wx ? Wx.conditions(state.data.S[r.i] && state.data.S[r.i].hourly, ev, t) : null;
+      wxT = t; wxC = window.Wx && o.mode === "live" ? Wx.conditions(ev, t, o.elev) : null;   // canvas fallback already draws its own weather
       { const wl = $("#pv-wxl"), tx = wxC ? Wx.label(wxC) : ""; if (wl) { wl.hidden = !tx; wl.textContent = tx; } }
       if (!wxRaf) wxRaf = requestAnimationFrame(wxLoop);
       $("#pv-time").textContent = fmtTime(t, r.tz);
-      $("#pv-phase").textContent = o.phase;
+      $("#pv-phase").textContent = phaseName(o.phase);
       $("#pv-elev").textContent = `sun ${o.elev >= 0 ? "+" : "−"}${Math.abs(o.elev).toFixed(1)}°`;
       const parts = [["high", ev.s.high, "Cirrus"], ["mid", ev.s.mid, "Mid cloud"], ["low", ev.s.low, "Low cloud"]].filter(x => x[1] >= 10).map(x => `${x[2]} ${word(o.lit[x[0]])}`);
       $("#pv-what").textContent = parts.length ? parts.join(" · ") : (o.elev > 0 ? "Clear sky: clean gradient, little canvas" : "Clear sky: horizon band fading");
@@ -380,8 +477,9 @@
     };
     const queue = () => { if (!raf) raf = requestAnimationFrame(render); };
     let wxT = 0, wxC = null, wxRaf = 0;
-    const wxLoop = now => { wxRaf = 0; const wc = $("#pv-wx"); if (!wc || !document.body.contains(cv)) return; if (wxC) Wx.draw(wc, wxC, now, ev.sunsetAz);
-      if (wxC && (wxC.rain > 0 || wxC.thunder > 0)) wxRaf = requestAnimationFrame(wxLoop); };
+    const wxLoop = now => { wxRaf = 0; const wc = $("#pv-wx"); if (!wc || !document.body.contains(cv)) return;
+      if (wxC) Wx.draw(wc, wxC, wxT, now); else { const c2 = wc.getContext("2d"); c2.setTransform(1, 0, 0, 1, 0, 0); c2.clearRect(0, 0, wc.width, wc.height); }
+      if (wxC && (wxC.rain || wxC.snow || wxC.bolt)) wxRaf = requestAnimationFrame(wxLoop); };
     let dragging = false, hqT = 0, photoOn = true;
     const ph = [$("#pv-ph0"), $("#pv-ph1")], badge = $("#pv-badge"), modeBtn = $("#pv-mode"), gen = $("#pv-gen");
     const [t0, t1] = scrubRange(ev.timing);
@@ -405,7 +503,7 @@
     }
     sl.addEventListener("input", () => { stop(); dragging = true; queue(); });
     document.querySelectorAll(".scrub .mk").forEach(b => b.addEventListener("click", () => { stop(); sl.value = b.dataset.t; queue(); }));
-    const stop = () => { if (playing) { cancelAnimationFrame(playing); playing = 0; $("#pv-play").textContent = "▶ Play the evening"; } };
+    const stop = () => { if (playing) { cancelAnimationFrame(playing); playing = 0; $("#pv-play").textContent = PLAY; } };
     $("#pv-play").onclick = () => {
       if (playing) return stop();
       const t0 = +sl.min, t1 = +sl.max, dur = 9000; let start = null;
@@ -431,30 +529,39 @@
       <div class="d-head"><p class="d-note">${sp.note}</p></div>
       <div class="d-score">
         <div class="ring big" style="--p:${ev.score};--c:${lb.c}"><b>${ev.score}</b><i>${lb.t}</i></div>
-        <div><div class="d-time">Sunset <b>${fmtTime(ev.tSet, r.tz)}</b></div>
+        <div><div class="d-time">${Ev} <b>${fmtTime(ev.tSet, r.tz)}</b></div>
         <div class="d-sub">Sky score <b>${ev.sky}</b> · Site fit <b>${ev.site}</b></div>
         <div class="conf ${conf.c}">${conf.t}</div></div>
       </div>
+      ${ev.tri.on || ev.tri.n >= 2 ? trifectaCard(r) : ""}
+      <h3>🌦️ Weather during ${EV} <small>${hm(ev.wx.win.start, r.tz)}–${hm(ev.wx.win.end, r.tz)}</small></h3>
+      <div class="wxd">${ev.wx.items.length ? ev.wx.items.map(w => `<div class="wxi ${w.id}"><b>${w.icon}</b><div><div class="wn">${w.name}${w.p ? ` <em>${w.p}%</em>` : ""}</div><div class="wt">${w.txt}${w.id === "bolt" && w.win ? ` Strikes most likely ${hm(w.win.start, r.tz)}–${hm(w.win.end, r.tz)}.` : ""}</div></div></div>`).join("") : `<div class="wxi none"><b>✓</b><div><div class="wn">No rain, wind, lightning or fog</div><div class="wt">Lightning ${ev.wx.bolt.p}% · wind ${ev.wx.wind.mph} mph (gusts ${ev.wx.wind.gust}) · rain chance ${ev.wx.rain.pp}%</div></div></div>`}</div>
+      <h3>✨ Special bonus <small>rainbow & sun-dog odds for this spot</small></h3>
+      <div class="bonus-d">${bonusCard(ev.bonus.bow, r, { kicker: ev.bonus.bow.red ? "Red rainbow (low sun)" : "Rainbow odds" })}${bonusCard(ev.bonus.dog, r, { kicker: "Sun-dog odds" })}</div>
       ${ev.gates.length ? `<div class="gates">${ev.gates.map(g => `<div>⚠ ${g}</div>`).join("")}</div>` : ""}
       <div class="timing">
-        <div><span>Golden hour</span><b>${tw(T.golden)}</b></div>
+        ${RISE ? `<div><span>Civil dawn</span><b>${tw(T.civilEnd)}</b></div>
+        <div><span>First color</span><b>${tw(T.glowEnd)}</b></div>
+        <div class="pk"><span>Best minute</span><b>${tw(T.peak)}</b></div>
+        <div><span>Sunrise</span><b>${tw(T.sunset)}</b></div>
+        <div><span>Golden hour ends</span><b>${tw(T.golden)}</b></div>` : `<div><span>Golden hour</span><b>${tw(T.golden)}</b></div>
         <div><span>Sunset</span><b>${tw(T.sunset)}</b></div>
         <div class="pk"><span>Best minute</span><b>${tw(T.peak)}</b></div>
         <div><span>Afterglow ends</span><b>${tw(T.glowEnd)}</b></div>
-        <div><span>Civil twilight</span><b>${tw(T.civilEnd)}</b></div>
+        <div><span>Civil twilight</span><b>${tw(T.civilEnd)}</b></div>`}
       </div>
       ${sunChart(r)}
-      <div class="fine">Peak timing from the dominant cloud height (${domTxt}): high cloud stays sunlit ~15–20 min after sunset, low cloud only ~4–8. Twilight lasts ~${T.twilightMin ?? "—"} min here today.</div>
+      <div class="fine">Peak timing from the dominant cloud height (${domTxt}): ${RISE ? "high cloud lights up ~15–20 min before sunrise, low cloud only ~4–8." : "high cloud stays sunlit ~15–20 min after sunset, low cloud only ~4–8."} Twilight lasts ~${T.twilightMin ?? "—"} min here today.</div>
       <h3>Sky phenomena <small>separate from the color score</small></h3>
       <div class="wow">${badges.map(b => `<div class="wb ${b.p >= 40 ? "hi" : b.p >= 22 ? "md" : b.p >= 10 ? "lo" : "no"}"><div class="wi">${b.icon}</div><div class="wn">${b.name}</div><div class="wl">${likely(b.p)}<small> · ${b.p}</small></div><div class="wt">${b.why}${b.p >= 10 && b.t ? ` <em>~${tw(b.t)}</em>` : ""}</div></div>`).join("")}</div>
       <h3>Why this score</h3>
       <ul class="why">${ev.reasons.map(x => `<li>${x}</li>`).join("")}</ul>
       <div class="comps">${ev.comp.map(c => `<div class="cp"><span>${c.k}</span><small>${c.w}%</small><div class="btrack"><i style="width:${Math.round(c.q * 100)}%"></i></div><b>${Math.round(c.q * c.w)}</b></div>`).join("")}
       <div class="fine">Weighted sum ×${ev.season.toFixed(2)} season prior, then gates. Overall = sky × site fit. All weights are starting estimates (Sunset Metric Bible v1 §13).</div></div>
-      <h3>Western gap ${tag(provenance(r).path)} <small>along the sunset line, ${compass(ev.sunsetAz)}</small></h3>
+      <h3>${DIRW}ern gap ${tag(provenance(r).path)} <small>along the ${EV} line, ${compass(ev.sunsetAz)}</small></h3>
       <div class="pathviz">${ev.path.map(p => `<div class="pv"><div class="pvk">${p.km} km</div>${barRow("Low", p.low)}${barRow("Mid", p.mid)}${barRow("High", p.high)}</div>`).join("")}</div>
       <div class="fine">Clouds 0–200 km toward the sun decide whether light reaches the sky above you. Blocked: <b>${Math.round(ev.slotBlock * 100)}%</b> (low + ½ mid, weighted toward nearby).</div>
-      <h3>Clouds overhead at sunset ${tag(provenance(r).clouds)}</h3>
+      <h3>Clouds overhead at ${EV} ${tag(provenance(r).clouds)}</h3>
       <div>${barRow("High", s.high)}${barRow("Mid", s.mid)}${barRow("Low", s.low)}${barRow("Total", s.total)}</div>
       <div class="ctypes">${(noaaCloudTypes(r) || ev.clouds).map(c => `<div class="ct"><span>${c.level}</span><b>${c.type}</b></div>`).join("")}<div class="fine">Cloud types are inferred from layer cover, instability (CAPE), visibility and weather code — the model doesn't output cloud genus. ${noaaCloudTypes(r) ? "Tonight they're checked against GOES-19 observed cloud phase and top height." : ""} ${tag(provenance(r).types)}</div></div>
       <h3>Cloud timeline</h3>${timeline(r)}
@@ -483,9 +590,9 @@
       <h3>Site & horizon</h3>
       <div class="grid">
         <div><span>Open view</span><b>${ev.siteInfo.arc[0]}°–${ev.siteInfo.arc[1]}°</b></div>
-        <div><span>Sunset azimuth</span><b>${Math.round(ev.sunsetAz)}° ${ev.siteInfo.inArc ? "✓" : "✗"}</b></div>
+        <div><span>${Ev} azimuth</span><b>${Math.round(ev.sunsetAz)}° ${ev.siteInfo.inArc ? "✓" : "✗"}</b></div>
         <div><span>Horizon obstruction</span><b>~${ev.siteInfo.obst}°</b></div>
-        <div><span>Water toward sunset</span><b>${ev.siteInfo.water ? "Yes" : "No"}</b></div>
+        <div><span>Water toward ${EV}</span><b>${ev.siteInfo.water ? "Yes" : "No"}</b></div>
         <div><span>Wind</span><b>${Math.round(s.wind)} mph ${compass(s.wdir)}</b></div>
         <div><span>Gusts</span><b>${Math.round(s.gust)} mph</b></div>
       </div>
@@ -516,7 +623,7 @@
     const reg = REGIONS[state.region].states;
     const pts = SPOTS.filter(s => !reg || reg.includes(s.state)).map(s => [s.lat, s.lng]);
     map.flyToBounds(pts, { padding: [40, 40], duration: 1 });
-    const list = filtered(); renderHero(list); renderList(list);
+    const list = filtered(); renderHero(list); renderBonus(list); renderList(list);
   }));
   $("#nearme").addEventListener("click", () => {
     if (!navigator.geolocation) return;
@@ -544,39 +651,21 @@
   renderSatGallery("se", "GEOCOLOR");
 
   // boot
-  // ---------- realistic build: Home link + sunrise wording ----------
-  if (AG.realistic) { const h = $("#gohome"), q = new URLSearchParams(location.search); if (h) { h.hidden = false; h.href = "./" + (q.get("realistic") ? "?realistic=" + q.get("realistic") : ""); } }
-  if (RISE) {
-    document.title = "Afterglow Real — Sunrise";
-    const tl = $("#tagline"); if (tl) tl.textContent = "East Coast sunrise forecast · Maine to the Gulf";
-    const R = [[/after sunset/g, "before sunrise"], [/before sunset/g, "after sunrise"], [/East Coast/g, "\u0001"], [/West Palm/g, "\u0007"],
-      [/\bWestern\b/g, "\u0002"], [/\bwestern\b/g, "\u0003"], [/\bWest\b/g, "\u0004"], [/\bwest\b/g, "\u0005"], [/\bWEST\b/g, "\u0006"],
-      [/\bEastern\b/g, "Western"], [/\beastern\b/g, "western"], [/\bEast\b/g, "West"], [/\beast\b/g, "west"], [/\bEAST\b/g, "WEST"],
-      [/\u0002/g, "Eastern"], [/\u0003/g, "eastern"], [/\u0004/g, "East"], [/\u0005/g, "east"], [/\u0006/g, "EAST"], [/\u0001/g, "East Coast"], [/\u0007/g, "West Palm"],
-      [/west-southwest/g, "east-southeast"], [/SUNSET/g, "SUNRISE"], [/Sunset/g, "Sunrise"], [/sunset/g, "sunrise"],
-      [/AFTERGLOW/g, "DAWN GLOW"], [/Afterglow/g, "Dawn glow"], [/afterglow/g, "dawn glow"], [/[Gg]low ends/g, m => m[0] + "low starts"],
-      [/Twilight ends/g, "Civil dawn"], [/\bDusk\b/g, "Dawn"], [/\bdusk\b/g, "dawn"], [/Tonight's/g, "This"], [/tonight's/g, "this"], [/\btonight\b/g, "this morning"],
-      [/Play the evening/g, "Play the morning"], [/the evening/g, "the morning"]];
-    const done = new WeakMap();
-    const fix = root => {
-      const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, { acceptNode: n => n.parentElement && n.parentElement.closest("[data-keep],script,style,#home") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT });
-      for (let n; (n = w.nextNode());) { if (done.get(n) === n.data) continue; let s = n.data; for (const [a, b] of R) s = s.replace(a, b); if (s !== n.data) n.data = s; done.set(n, s); }
-    };
-    new MutationObserver(muts => { for (const m of muts) { const t = m.type === "characterData" ? m.target.parentNode : m.target; if (t) fix(t); } }).observe(document.body, { childList: true, subtree: true, characterData: true });
-    fix(document.body);
-  }
-
   Promise.all([loadData(), loadNoaa()]).then(([d, N]) => {
-    state.noaa = N; applyNoaa(d, N); state.data = d; update();
-    // Afterglow Real deep link: ?mode=sunset&spot=clearwater&play=1 opens the spot and plays the evening
-    { const q = new URLSearchParams(location.search), id = q.get("spot");
-      if (id && state.results && state.results.some(x => x.spot.id === id)) Promise.resolve(openDetail(id)).then(() => { if (q.get("t") && $("#scrub")) { const T = state.results.find(x => x.spot.id === id).ev.timing; const v = q.get("t") === "peak" ? T.peak : +q.get("t"); $("#scrub").value = v; $("#scrub").dispatchEvent(new Event("input")); } if (q.get("play") === "1") setTimeout(() => { const b = $("#pv-play"); if (b) b.click(); }, 700); }); }
+    state.noaa = N; window.AGNoaa = N; window.AGDay = () => state.day; applyNoaa(d, N); state.data = d;
+    if (RISE && d.S[0] && d.S[0].daily.sunrise[0] + 3600 < Date.now() / 1000) state.day = 1;   // this morning's sunrise is over → show tomorrow
+    update();
     $("#loading").classList.add("done");
+    // Afterglow Real deep link: ?mode=sunset&spot=clearwater&t=peak&play=1
+    { const q = new URLSearchParams(location.search), id = q.get("spot");
+      if (q.get("day") != null && state.data.S[0].daily.time[+q.get("day")] != null) { state.day = +q.get("day"); update(); }
+      if (id && state.results.some(x => x.spot.id === id)) Promise.resolve(openDetail(id)).then(() => { const sl = $("#scrub"); if (q.get("t") && sl) { const T = state.results.find(x => x.spot.id === id).ev.timing; const R2 = state.results.find(x => x.spot.id === id).ev, bw = R2.bonus && R2.bonus.bow && R2.bonus.bow.win; sl.value = q.get("t") === "peak" ? T.peak : q.get("t") === "bow" && bw ? (bw.start + bw.end) / 2 : +q.get("t"); sl.dispatchEvent(new Event("input")); } if (q.get("play") === "1") setTimeout(() => { const b = $("#pv-play"); if (b) b.click(); }, 700); }); }
     $("#updated").innerHTML = "Forecast updated " + new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit", timeZoneName: "short" }).format(new Date(d.at)) +
+      (d.snapshot ? ` · <span class="src fb">Snapshot</span> live forecast busy — showing NOAA data saved ${fmtClock(new Date(d.at).toISOString())}` : d.stale ? ` · <span class="src fb">Cached</span> live forecast busy — using last download` : "") +
       (d.fcModel === "fallback" ? ` · <span class="src fb">Fallback</span> NOAA mirror unreachable — Open-Meteo best-match` : ` · <span class="src model">NOAA model</span> HRRR→GFS`) +
       (N ? ` · <span class="src obs">NOAA obs</span> GOES-19 L2 ${N.goes && N.goes.products.ACM ? fmtClock(N.goes.products.ACM.scan_utc) : "n/a"}${N.hrrr ? `, HRRR ${new Date(N.hrrr.cycle_utc).toISOString().slice(11, 13)}Z direct` : ""}${N.metar ? `, METAR` : ""}` : ` · <span class="src fb">NOAA direct feed offline</span>`);
   }).catch(err => {
     console.error(err);
-    $("#loading").innerHTML = `<div class="err">Couldn't reach the forecast service (Open-Meteo). Check your connection and reload.</div>`;
+    $("#loading").innerHTML = `<div class="err">Couldn't reach the forecast service (Open-Meteo). Check your connection and <a href="#" onclick="location.reload();return false">tap to retry</a>.</div>`;
   });
 })();

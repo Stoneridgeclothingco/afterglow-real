@@ -31,6 +31,7 @@ uniform float uDog;
 uniform float uMeter;
 uniform float uPixScale;
 uniform float uTwi;
+uniform float uMidH;    // mid-deck base km (HRRR cloud base / GOES cloud-top height), default 4.5
 uniform float uBlockGap; // 0..1 clear slot on the far horizon toward the sun (from the 120/200 km path forecast)
 
 const float PI = 3.14159265;
@@ -173,7 +174,7 @@ float dens(int L, vec2 p, float fp, float dist){
     return clamp(max(lo, (.25 + .45*b) * (.7 + .3*er) * sheetW), 0., 1.);
   }
 }
-vec3 layerH(int L){ return L == 0 ? vec3(9.0, 1.0, 1.0) : L == 1 ? vec3(4.5, .45, 7.0) : vec3(1.4, .6, 18.0); } // alt, thickness, tau scale
+vec3 layerH(int L){ return L == 0 ? vec3(max(9.0, uMidH + 1.5), 1.0, 1.0) : L == 1 ? vec3(uMidH, .45, 7.0) : vec3(1.4, .6, 18.0); } // alt, thickness, tau scale
 
 vec3 cloudShade(int L, vec3 P, vec3 rd, float t, float pixA, out float alpha){
   vec3 lh = layerH(L);
@@ -205,7 +206,7 @@ vec3 cloudShade(int L, vec3 P, vec3 rd, float t, float pixA, out float alpha){
   vec3 hA = sunT(P + up*2.5, sun), hB = sunT(P + up*12., sun);
   float skyLit = dot(hA, vec3(.25,.45,.3))*.75 + dot(hB, vec3(.25,.45,.3))*.25;
   vec3 amb = ESUN * (vec3(.007,.013,.028) * (skyLit + .012) + .005*hA*vec3(1.,.75,.65));
-  amb *= mix(1., .55, d);
+  amb *= mix(1., .45, d);
   // once the deck is in Earth's shadow it is lit only by the dim twilight sky: let it sit just below the sky, not glow
   amb *= mix(L == 0 ? .6 : .8, 1., clamp(dot(Ts, vec3(.33)) * 25., 0., 1.));
   // internal texture: thin edges glow (silver lining), thick cores go darker when back-lit
@@ -220,7 +221,7 @@ vec3 skyRay(vec3 ro, vec3 rd, float pixA, bool full, out vec3 Tout){
   float cs = dot(rd, uSun);
   vec2 top = sph(ro, rd, RT);
   float tEnd = top.y;
-  float tc[3]; tc[2] = sph(ro, rd, R0 + 1.4).y; tc[1] = sph(ro, rd, R0 + 4.5).y; tc[0] = sph(ro, rd, R0 + 9.).y;
+  float tc[3]; tc[2] = sph(ro, rd, R0 + 1.4).y; tc[1] = sph(ro, rd, R0 + uMidH).y; tc[0] = sph(ro, rd, R0 + layerH(0).x).y;
   int ns = full ? 7 : 4;
   float prev = 0.;
   for (int k = 2; k >= 0; k--){
@@ -484,8 +485,10 @@ void main(){
     gl.uniform1f(U.uLQ, P.lq ? 1 : 0); gl.uniform1f(U.uDog, P.dog || 0); gl.uniform1f(U.uPixScale, 1);
     gl.uniform1f(U.uTwi, Math.max(0, Math.min(1, (1.5 - P.elev) / 3)) * Math.max(0, Math.min(1, (P.elev + 8) / 3))); gl.uniform1f(U.uGrainT, P.grain || 0.37);
     gl.uniform1f(U.uBlockGap, P.gap || 0);
+    gl.uniform1f(U.uMidH, clamp(P.midKm || 4.5, 2.5, 7.5));
     gl.uniform1f(U.uMeter, 0);
-    const ex = P.expo != null ? P.expo : meter(gl, U, w, h, P);
+    const ovc = clamp((Math.max(P.mid, P.low, P.high * 0.6) - 0.5) / 0.45);
+    const ex = P.expo != null ? P.expo : meter(gl, U, w, h, P) * (1 - 0.3 * ovc);
     gl.viewport(0, 0, w, h); gl.uniform2f(U.uRes, w, h); gl.uniform1f(U.uMeter, 0); gl.uniform1f(U.uExpo, ex);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     render.lastExpo = ex;
@@ -495,7 +498,7 @@ void main(){
   // the way a photographer exposes a sunset (protect highlights, keep saturation). Blended with a twilight curve.
   const mcache = {};
   function meter(gl, U, w, h, P) {
-    const key = [P.elev, P.high, P.mid, P.low, P.block, P.aod, P.seed, P.water, P.pier].map(v => typeof v === "number" ? v.toFixed(3) : v).join("|") + "|" + (w / h).toFixed(2);
+    const key = [P.elev, P.high, P.mid, P.low, P.block, P.aod, P.seed, P.water, P.pier, P.midKm || 4.5, P.gap || 0].map(v => typeof v === "number" ? v.toFixed(3) : v).join("|") + "|" + (w / h).toFixed(2);
     if (mcache[key]) return mcache[key];
     const mw = 64, mh = Math.max(24, Math.round(64 * h / w));
     gl.viewport(0, 0, mw, mh); gl.uniform2f(U.uRes, mw, mh); gl.uniform1f(U.uMeter, 1); gl.uniform1f(U.uLQ, 0); gl.uniform1f(U.uPixScale, w / mw);

@@ -1,77 +1,67 @@
-// Afterglow Real: forecast-gated weather layer drawn over the sky render.
-// Draws ONLY what the forecast predicts at the slider time: rain (precipitation / rain codes),
-// lightning (thunderstorm weather codes 95–99), rainbow (model rainbow odds near its predicted time). Never invents weather.
+// Afterglow Real: forecast-gated weather drawn over the WebGL sky render. Same gates as the live app's sky animation:
+//  rain/snow only if the forecast lists rain/snow in the event window; lightning only if lightning odds >= 25% (near its window);
+//  fog only when forecast; rainbow only if rainbow odds >= 10% AND the slider time is inside the forecast rainbow window with the sun up.
+//  Clouds come from HRRR/GOES in the sky shader itself. Nothing is invented.
 (function (g) {
   const clamp = (x, a = 0, b = 1) => Math.max(a, Math.min(b, x));
-  function series(h, key, t) {
-    if (!h || !h[key] || !h.time) return null;
-    const T = h.time, f = (t - T[0]) / 3600, i = Math.floor(f);
-    if (i < 0 || i >= T.length) return null;
-    const a = h[key][i], b = h[key][Math.min(T.length - 1, i + 1)];
-    return a == null ? b : b == null ? a : a + (b - a) * (f - i);
-  }
-  const codeAt = (h, t) => { if (!h || !h.weather_code) return null; const i = Math.round((t - h.time[0]) / 3600); return h.weather_code[Math.max(0, Math.min(h.time.length - 1, i))]; };
-  const RAIN = c => (c >= 51 && c <= 67) || (c >= 80 && c <= 82) || c >= 95;
-  // what the forecast says at time t
-  function conditions(h, ev, t) {
-    const pr = series(h, "precipitation", t) || 0, pp = series(h, "precipitation_probability", t) || 0, code = codeAt(h, t);
-    const wind = series(h, "wind_speed_10m", t) || 0, wdir = series(h, "wind_direction_10m", t) || 0;
-    const rain = (pr >= 0.1 || (RAIN(code) && pp >= 30)) ? clamp(Math.max(pr / 4, RAIN(code) ? 0.25 : 0), 0.12, 1) : 0;
-    const thunder = code >= 95 ? (code === 95 ? 0.6 : 1) : 0;
-    const bp = ev.bow ? ev.bow.p : 0, bt = ev.bow && ev.bow.t;
-    const bow = bp >= 15 && bt ? clamp(bp / 60) * clamp(1 - Math.abs(t - bt) / 2400) : 0;
-    return { rain, thunder, bow, bowP: bp, wind, wdir, code, pr, pp };
+  function conditions(ev, t, elev) {
+    const WX = ev.wx || { items: [], bolt: { p: 0 }, wind: { mph: 0 } }, on = id => WX.items.some(x => x.id === id);
+    const bp = WX.bolt.p || 0, bw = WX.bolt.win;
+    const bolt = bp >= 25 && (!bw || (t >= bw.start - 1800 && t <= bw.end + 1800)) ? clamp(bp / 60, 0.4, 1) : 0;
+    const rainIt = WX.items.find(x => x.id === "rain");
+    const rain = rainIt ? clamp(0.25 + (WX.rain && WX.rain.mm || 0) / 4 + (WX.rain && WX.rain.pp || 0) / 300, 0.2, 1) : 0;
+    const snow = on("snow") ? 0.7 : 0, fog = on("fog") ? 0.6 : 0;
+    const bow = ev.bonus && ev.bonus.bow, bwin = bow && bow.win;
+    const bowOn = !!(bow && bow.p >= 10 && bwin && t >= bwin.start && t <= bwin.end && elev > -0.3 && elev < 42);
+    const bowA = bowOn ? clamp(Math.min(t - bwin.start, bwin.end - t) / 420) * clamp(0.35 + bow.p / 60) : 0;
+    return { bolt, boltP: bp, rain, rainName: rainIt && rainIt.name, snow, fog, bow: bowA, bowP: bow ? bow.p : 0, red: bow && bow.red, wind: WX.wind && WX.wind.mph || 0 };
   }
   let drops = null;
-  function draw(cv, C, now, facingAz) {
+  function draw(cv, C, t, now) {
     const W = cv.clientWidth, H = cv.clientHeight, dpr = Math.min(2, g.devicePixelRatio || 1);
-    if (cv.width !== Math.round(W * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); }
+    if (!W || !H) return;
+    if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); }
     const x = cv.getContext("2d"); x.setTransform(dpr, 0, 0, dpr, 0, 0); x.clearRect(0, 0, W, H);
-    const hz = H * 0.62; // horizon line of the stage render
-    // rainbow (antisolar — sits opposite the sun, so for a west view it is behind you; drawn as a faint arc + label)
-    if (C.bow > 0.02) {
-      const cx = W * 0.5, cy = hz + H * 0.05, R = Math.min(W, H) * 0.62, cols = ["#ff3b3b", "#ff8a1f", "#ffe14d", "#4fd05a", "#3fa0ff", "#6a4dff", "#b04dff"];
-      x.save(); x.globalCompositeOperation = "screen"; x.lineWidth = Math.max(2, R * 0.018);
-      cols.forEach((c, k) => { x.globalAlpha = 0.33 * C.bow; x.strokeStyle = c; x.beginPath(); x.arc(cx, cy, R - k * x.lineWidth, Math.PI, 2 * Math.PI); x.stroke(); });
+    const hz = H * 0.6, slant = -0.1 - clamp(C.wind / 30) * 0.5;
+    if (C.fog) { const gr = x.createLinearGradient(0, hz - H * 0.3, 0, H); gr.addColorStop(0, "rgba(200,205,215,0)"); gr.addColorStop(0.5, `rgba(200,205,215,${0.45 * C.fog})`); gr.addColorStop(1, `rgba(190,195,205,${0.3 * C.fog})`); x.fillStyle = gr; x.fillRect(0, 0, W, H); }
+    if (C.bolt) {   // storm cell + flicker; deterministic per minute of forecast time, plus a live flicker while it sits still
+      const k = Math.floor(t / 60) + Math.floor(now / 2400), ph = now % 2400, a = (ph < 70 ? 1 : ph < 120 ? 0.25 : ph < 190 ? 0.75 : 0) * C.bolt;
+      const gr = x.createRadialGradient(W * 0.16, hz - H * 0.25, 4, W * 0.16, hz - H * 0.25, W * 0.4); gr.addColorStop(0, "rgba(28,27,44,.75)"); gr.addColorStop(1, "rgba(28,27,44,0)"); x.fillStyle = gr; x.fillRect(0, 0, W, hz + 4);
+      if (a > 0) {
+        x.save(); x.fillStyle = `rgba(220,228,255,${0.22 * a})`; x.fillRect(0, 0, W, hz);
+        let bx = W * (0.08 + 0.22 * (Math.sin(k * 91.7) * 0.5 + 0.5)), by = hz - H * 0.36;
+        x.strokeStyle = `rgba(255,255,255,${a})`; x.lineWidth = 2; x.shadowColor = "#bcd0ff"; x.shadowBlur = 16; x.beginPath(); x.moveTo(bx, by);
+        for (let s = 1; s <= 9; s++) { bx += Math.sin(k * 13.1 + s * 7.3) * W * 0.03; by += H * 0.36 / 9; x.lineTo(bx, by); }
+        x.stroke(); x.restore();
+      }
+    }
+    if (C.rain || C.snow) {
+      const n = Math.round(60 + 240 * Math.max(C.rain, C.snow));
+      if (!drops || drops.length !== n) drops = Array.from({ length: n }, (_, i) => [((i * 0.618) % 1), ((i * 0.377) % 1), 0.6 + ((i * 0.733) % 1) * 0.8]);
+      const fall = ((t / 30) % 1 + 1) % 1 + now * (C.snow ? 0.00015 : 0.0008);
+      x.save();
+      if (C.snow) { x.fillStyle = "rgba(255,255,255,.75)"; for (const d of drops) { const y = ((d[1] + fall * d[2]) % 1) * H, xx = (((d[0] + slant * 0.2 * y / H) % 1) + 1) % 1 * W; x.beginPath(); x.arc(xx, y, 1 + d[2], 0, 6.283); x.fill(); } }
+      else { x.strokeStyle = "rgba(205,215,232,.42)"; x.lineWidth = 1; x.beginPath();
+        for (const d of drops) { const y = ((d[1] + fall * d[2]) % 1) * (H + 30) - 15, xx = (((d[0] + slant * 0.3 * y / H) % 1) + 1) % 1 * W, L = 9 + 13 * d[2]; x.moveTo(xx, y); x.lineTo(xx + slant * L, y + L); }
+        x.stroke();
+        const gr = x.createLinearGradient(0, hz - H * 0.22, 0, hz + 6); gr.addColorStop(0, "rgba(110,116,132,0)"); gr.addColorStop(1, `rgba(110,116,132,${0.3 * C.rain})`); x.fillStyle = gr; x.fillRect(0, hz - H * 0.22, W, H * 0.22 + 6); }
       x.restore();
     }
-    // rain streaks, slanted by the forecast wind
-    if (C.rain > 0) {
-      const n = Math.round(40 + 260 * C.rain);
-      if (!drops || drops.length !== n) drops = Array.from({ length: n }, () => [Math.random(), Math.random(), 0.6 + Math.random() * 0.8]);
-      const rel = Math.sin(((C.wdir + 180 - (facingAz || 270)) * Math.PI) / 180), slant = clamp(C.wind / 40, 0, 0.6) * rel;
-      x.save(); x.strokeStyle = "rgba(210,220,235,.45)"; x.lineWidth = 1;
-      x.beginPath();
-      for (const d of drops) {
-        const sp = d[2], y = ((d[1] + now * 0.0009 * sp) % 1) * (H + 40) - 20, xx = ((d[0] + slant * y / H * 0.3) % 1 + 1) % 1 * W, L = 10 + 14 * sp;
-        x.moveTo(xx, y); x.lineTo(xx + slant * L, y + L);
-      }
-      x.stroke();
-      // rain veil low on the horizon
-      const gr = x.createLinearGradient(0, hz - H * 0.25, 0, hz + 4); gr.addColorStop(0, "rgba(120,125,140,0)"); gr.addColorStop(1, `rgba(120,125,140,${0.25 * C.rain})`);
-      x.fillStyle = gr; x.fillRect(0, hz - H * 0.25, W, H * 0.25 + 4); x.restore();
-    }
-    // lightning: brief cloud flash + occasional bolt, only for thunderstorm codes
-    if (C.thunder > 0) {
-      const cyc = 2600 / C.thunder, ph = now % cyc, k = Math.floor(now / cyc);
-      if (ph < 220) {
-        const a = (ph < 60 ? 1 : ph < 110 ? 0.3 : ph < 160 ? 0.8 : 0.15) * C.thunder;
-        x.save(); x.fillStyle = `rgba(225,230,255,${0.28 * a})`; x.fillRect(0, 0, W, hz);
-        if (k % 2 === 0) {
-          let r = Math.sin(k * 91.7) * 0.5 + 0.5, bx = W * (0.2 + 0.6 * r), by = H * 0.18;
-          x.strokeStyle = `rgba(255,255,255,${0.95 * a})`; x.lineWidth = 2; x.shadowColor = "#bcd0ff"; x.shadowBlur = 14; x.beginPath(); x.moveTo(bx, by);
-          for (let s = 1; s <= 9; s++) { r = Math.sin(k * 13.1 + s * 7.3); bx += r * W * 0.035; by += (hz - H * 0.18) / 9; x.lineTo(bx, by); }
-          x.stroke();
-        }
-        x.restore();
-      }
+    if (C.bow > 0.01) {   // the bow is opposite the sun, i.e. behind someone facing the event: inset "look behind you" panel
+      const pw = Math.min(W * 0.42, 190), ph = pw * 0.62, px = W - pw - 12, py = H * 0.2;
+      x.save(); x.globalAlpha = clamp(C.bow * 1.4); x.fillStyle = "rgba(60,62,86,.85)"; x.strokeStyle = "rgba(255,255,255,.5)"; x.lineWidth = 1;
+      x.beginPath(); x.roundRect ? x.roundRect(px, py, pw, ph, 10) : x.rect(px, py, pw, ph); x.fill(); x.stroke(); x.clip();
+      const cols = C.red ? ["#ff4a3a", "#ff7a2a", "#ffae3a", "#ffd25a"] : ["#ff3b3b", "#ff8a1f", "#ffe14d", "#4fd05a", "#3fa0ff", "#6a4dff"], R = pw * 0.42, bw = R * 0.05;
+      x.globalCompositeOperation = "lighter"; x.lineWidth = bw;
+      cols.forEach((c, i) => { x.strokeStyle = c; x.beginPath(); x.arc(px + pw / 2, py + ph * 0.95, R - i * bw, Math.PI, 2 * Math.PI); x.stroke(); });
+      x.globalCompositeOperation = "source-over"; x.globalAlpha = 1; x.fillStyle = "#fff"; x.font = "600 11px Inter,sans-serif"; x.textAlign = "center";
+      x.fillText(`🌈 ${C.red ? "Red rainbow" : "Rainbow"} ${C.bowP}% · behind you`, px + pw / 2, py + 15); x.restore();
     }
   }
   function label(C) {
     const t = [];
-    if (C.rain > 0) t.push(`🌧 Rain forecast (${C.pr.toFixed(1)} mm/h${C.pp ? ", " + Math.round(C.pp) + "%" : ""})`);
-    if (C.thunder > 0) t.push("⚡ Thunderstorm forecast");
-    if (C.bow > 0.02) t.push(`🌈 Rainbow ${C.bowP}% — look east, behind you`);
+    if (C.rain) t.push(`🌧️ ${C.rainName || "Rain"} forecast`); if (C.snow) t.push("❄️ Snow forecast"); if (C.fog) t.push("🌫️ Fog forecast");
+    if (C.bolt) t.push(`⚡ Lightning ${C.boltP}%`); if (C.bow > 0.01) t.push(`🌈 Rainbow ${C.bowP}%`);
     return t.join(" · ");
   }
   g.Wx = { conditions, draw, label };

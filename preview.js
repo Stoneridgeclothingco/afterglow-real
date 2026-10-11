@@ -33,9 +33,8 @@
     const dep = DEPRESS[dom] || 2;
     if (elev > 6.3) return "Daylight";
     if (elev > -0.3) return "Golden hour";
-    const rise = !!(window.AG && window.AG.rise);
-    if (elev > -1.4) return rise ? "Sunrise" : "Sunset";
-    if (elev > -dep - 0.3) return rise ? "Dawn glow" : "Afterglow";
+    if (elev > -1.4) return "Sunset";
+    if (elev > -dep - 0.3) return "Afterglow";
     if (elev > -6.3) return "Blue hour";
     return "Night";
   }
@@ -183,8 +182,33 @@
       const rim = L.low.lit * near(p.x);
       if (rim > 0.08) { ctx.strokeStyle = rgba(L.low.c, 0.7 * rim); ctx.lineWidth = 1.6; ctx.beginPath(); ctx.ellipse(p.x, p.y, p.rx, p.ry, 0, Math.PI * 1.08, Math.PI * 1.92); ctx.stroke(); }
     }
-    // rain shafts
-    if ((s.precip || 0) > 0.1 || (s.pprob || 0) > 50) { ctx.strokeStyle = rgba(mix(shade, [200, 200, 220], 0.4), 0.2); ctx.lineWidth = 1; for (const p of G.rain) { ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - 6, p.y + H * 0.25); ctx.stroke(); } }
+    // weather during the event window (from the forecast): rain slanted by wind, storm cell + lightning, whitecaps
+    const WX = ev.wx || { items: [], bolt: { p: 0 }, wind: { mph: s.wind || 0 } };
+    const wxOn = id => WX.items.some(x => x.id === id);
+    const windMph = Math.max(WX.wind.mph || 0, s.wind || 0), slant = -6 - clamp(windMph / 30) * 34;
+    const boltP = WX.bolt.p || 0, bw = WX.bolt.win, boltNear = boltP >= 25 && (!bw || (t >= bw.start - 1800 && t <= bw.end + 1800));
+    if (boltNear) {   // dark storm cell on the side away from the sun's glow
+      const cx = W * 0.14, top = H * 0.08, cell = mix(shade, [34, 32, 52], 0.6);
+      blob(ctx, cx, hz - H * 0.22, W * 0.2, H * 0.2, cell, 0.95); blob(ctx, cx + W * 0.08, top + H * 0.07, W * 0.24, H * 0.06, cell, 0.85); blob(ctx, cx - W * 0.04, hz - H * 0.36, W * 0.13, H * 0.13, cell, 0.9);
+      ctx.strokeStyle = rgba(cell, 0.35); ctx.lineWidth = 1.2; for (let i = 0; i < 26; i++) { const x = cx - W * 0.14 + i * W * 0.011; ctx.beginPath(); ctx.moveTo(x, hz - H * 0.1); ctx.lineTo(x + slant * 0.6, hz); ctx.stroke(); }
+    }
+    // rain / snow falls as the slider or Play moves (offset by forecast time); drawn ONLY when the forecast has it
+    const fall = ((t / 30) % 1 + 1) % 1;
+    if (wxOn("snow")) {
+      ctx.fillStyle = "rgba(240,244,255,0.75)";
+      for (const p of G.rain) { const yy = H * 0.05 + ((p.y / H + fall * 0.6) % 1) * (H - H * 0.05), xx = p.x + slant * 0.4 * ((yy / H + fall) % 1); ctx.beginPath(); ctx.arc(xx, yy, 1.1 + (p.x % 3) * 0.5, 0, 6.283); ctx.fill(); }
+    } else if ((s.precip || 0) > 0.1 || (s.pprob || 0) > 50 || wxOn("rain")) { ctx.strokeStyle = rgba(mix(shade, [200, 200, 220], 0.4), wxOn("rain") ? 0.3 : 0.2); ctx.lineWidth = 1; const dy = fall * H * 0.25; for (const p of G.rain) { const y0 = p.y - H * 0.12 + dy; ctx.beginPath(); ctx.moveTo(p.x - slant * fall, y0); ctx.lineTo(p.x - slant * fall + slant, y0 + H * 0.25); ctx.stroke(); } }
+    if (boltNear) {   // lightning: flickers as the time slider / Play moves (deterministic per minute)
+      const m = Math.floor(t / 60), hsh = ((m * 2654435761) >>> 0) % 7, strong = boltP >= 40 ? hsh !== 3 : hsh % 3 === 0;
+      if (strong) {
+        const rb = rng(spot.id + "bolt" + (m % 5)); let x = W * (0.1 + rb() * 0.1), y = hz - H * 0.3; const pts = [[x, y]];
+        while (y < hz - 2) { y += H * (0.03 + rb() * 0.04); x += (rb() - 0.5) * W * 0.04; pts.push([x, Math.min(y, hz - 2)]); }
+        ctx.save(); ctx.globalCompositeOperation = "lighter";
+        const fl = ctx.createRadialGradient(pts[0][0], pts[0][1], 2, pts[0][0], pts[0][1], W * 0.3); fl.addColorStop(0, "rgba(200,190,255,0.35)"); fl.addColorStop(1, "rgba(200,190,255,0)"); ctx.fillStyle = fl; ctx.fillRect(0, 0, W, hz);
+        for (const [lw, a] of [[6, 0.15], [3, 0.35], [1.4, 0.95]]) { ctx.strokeStyle = `rgba(235,230,255,${a})`; ctx.lineWidth = lw; ctx.beginPath(); pts.forEach(([px, py], i) => i ? ctx.lineTo(px, py) : ctx.moveTo(px, py)); ctx.stroke(); }
+        ctx.restore();
+      }
+    }
     // haze veil at the horizon
     if (haze > 0.02) { const hzG = ctx.createLinearGradient(0, hz - H * 0.3, 0, hz); hzG.addColorStop(0, "rgba(220,200,190,0)"); hzG.addColorStop(1, rgba(mix([220, 200, 190], hor, 0.5), haze)); ctx.fillStyle = hzG; ctx.fillRect(0, 0, W, hz); }
 
@@ -206,10 +230,66 @@
         ctx.fillStyle = `rgba(0,0,10,${0.12 + 0.1 * d})`; ctx.fillRect((rp.w * 1.7 % 1) * W - 40, yy + 3, 80 + rp.j * 60, 1.2);
       }
     }
+    if (spot.water !== false && windMph >= 15) {   // whitecaps on windy water
+      const rw = rng(spot.id + "caps"), n = Math.round(clamp((windMph - 12) / 20) * 60) + 10;
+      ctx.fillStyle = "rgba(230,235,245,0.35)"; for (let i = 0; i < n; i++) { const d = rw(), yy = hz + 4 + d * d * (H - hz - 6); ctx.fillRect(rw() * W, yy, (3 + rw() * 10) * (0.4 + d * 1.6), 1.2); }
+    }
     silhouette(ctx, spot, W, H, hz, rng(spot.id + "fg"));
+    // fog: only when the forecast has fog codes / visibility < 1 km in the event window
+    if (wxOn("fog")) {
+      const fc = mix(hor, [196, 196, 204], 0.55), fg = ctx.createLinearGradient(0, hz - H * 0.32, 0, H);
+      fg.addColorStop(0, rgba(fc, 0)); fg.addColorStop(0.35, rgba(fc, 0.62)); fg.addColorStop(0.6, rgba(fc, 0.5)); fg.addColorStop(1, rgba(fc, 0.25));
+      ctx.fillStyle = fg; ctx.fillRect(0, 0, W, H);
+    }
     // vignette
     const vg = ctx.createRadialGradient(W / 2, H * 0.55, H * 0.3, W / 2, H * 0.55, Math.max(W, H) * 0.85); vg.addColorStop(0, "rgba(0,0,0,0)"); vg.addColorStop(1, "rgba(5,3,14,0.55)"); ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H);
-    return { elev, phase: phaseOf(elev, ev.timing.dom), lit: L };
+    // RAINBOW: a rainbow sits opposite the sun, i.e. BEHIND someone facing the sunset/sunrise, so it gets its own
+    // "look behind you" panel. Drawn ONLY when the forecast rainbow odds clear the bonus threshold (>= 10%)
+    // AND the slider/Play time is inside the forecast rainbow window, with the sun above the horizon.
+    const bow = ev.bonus && ev.bonus.bow, bwin = bow && bow.win;
+    const bowOn = !!(bow && bow.p >= 10 && bwin && t >= bwin.start && t <= bwin.end && app > -0.3 && elev < 42);
+    if (bowOn) rainbowPanel(ctx, W, H, bow, elev, clamp(Math.min(t - bwin.start, bwin.end - t) / 420), lightIn, slant, fall);
+    return { elev, phase: phaseOf(elev, ev.timing.dom), lit: L, bow: bowOn, bolt: !!boltNear };
+  }
+
+  // Inset panel: the antisolar sky (behind the viewer) with the rain shaft and the bow.
+  // Bow radius 42 deg (red outside, violet inside); its top sits (42 - sun elevation) deg above the horizon,
+  // so a low sun gives a tall, near-semicircle bow. Strength follows the forecast odds; a very low sun turns it red.
+  function rainbowPanel(ctx, W, H, bow, elev, fade, lightIn, slant, fall) {
+    const rise = window.AG_MODE === "sunrise", pw = Math.round(Math.min(W * 0.36, 230)), ph = Math.round(pw * 0.62);
+    const x0 = W - pw - 10, y0 = 10, ihz = y0 + ph * 0.8, cx = x0 + pw / 2, rad = pw * 0.38;
+    const a = fade * clamp(0.35 + bow.p / 60, 0, 1) * (0.5 + 0.5 * lightIn);
+    if (a <= 0.01) return;
+    const box = () => { ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(x0, y0, pw, ph, 10); else ctx.rect(x0, y0, pw, ph); };
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, fade * 1.5);
+    box(); ctx.save(); ctx.clip();
+    // dark rain-curtain sky opposite the sun, lit warm from behind by the low sun
+    const sk = ctx.createLinearGradient(0, y0, 0, ihz); sk.addColorStop(0, "rgb(52,56,78)"); sk.addColorStop(1, bow.red ? "rgb(120,84,92)" : "rgb(96,100,124)");
+    ctx.fillStyle = sk; ctx.fillRect(x0, y0, pw, ph);
+    ctx.strokeStyle = "rgba(200,205,225,0.22)"; ctx.lineWidth = 1;
+    for (let i = 0; i < 34; i++) { const x = x0 + (i * 37 % pw), y = y0 + (((i * 53 % ph) / ph + fall) % 1) * ph * 0.8; ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + slant * 0.25, y + ph * 0.14); ctx.stroke(); }
+    // the bow: centre = antisolar point, below the horizon by the sun's elevation
+    const pxDeg = rad / 42, by = ihz + Math.max(0, elev) * pxDeg, bands = bow.red
+      ? [[255, 70, 40], [255, 110, 50], [255, 150, 70], [240, 170, 90]]
+      : [[255, 40, 40], [255, 140, 30], [255, 230, 60], [70, 200, 80], [60, 120, 255], [110, 70, 210], [150, 70, 200]];
+    const bwid = rad * 0.034;
+    ctx.globalCompositeOperation = "lighter";
+    bands.forEach((c, i) => { ctx.strokeStyle = rgba(c, a * (bow.red && i > 1 ? 0.55 : 0.8)); ctx.lineWidth = bwid * 1.15; ctx.beginPath(); ctx.arc(cx, by, rad - i * bwid, Math.PI, 2 * Math.PI); ctx.stroke(); });
+    // brighter sky inside the bow; faint secondary bow (51 deg, reversed colours) when odds are high
+    const inG = ctx.createRadialGradient(cx, by, 0, cx, by, rad - bands.length * bwid); inG.addColorStop(0, "rgba(255,255,255,0)"); inG.addColorStop(0.85, `rgba(255,250,240,${0.12 * a})`); inG.addColorStop(1, "rgba(255,250,240,0)");
+    ctx.fillStyle = inG; ctx.fillRect(x0, y0, pw, ihz - y0);
+    if (bow.p >= 30) bands.slice().reverse().forEach((c, i) => { ctx.strokeStyle = rgba(c, a * 0.22); ctx.lineWidth = bwid * 1.3; ctx.beginPath(); ctx.arc(cx, by, rad * 51 / 42 - i * bwid * 1.3, Math.PI, 2 * Math.PI); ctx.stroke(); });
+    ctx.globalCompositeOperation = "source-over";
+    ctx.fillStyle = "rgb(14,14,26)"; ctx.fillRect(x0, ihz, pw, ph);   // ground behind you
+    ctx.restore();
+    ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.lineWidth = 1; box(); ctx.stroke();
+    ctx.fillStyle = "rgba(255,255,255,0.92)"; ctx.textBaseline = "bottom";
+    const lbl = `🌈 ${bow.red ? "Red rainbow" : "Rainbow"} ${bow.p}% · behind you (${rise ? "W" : "E"})`;
+    let fs = Math.max(9, Math.round(ph * 0.1)); ctx.font = `600 ${fs}px system-ui, sans-serif`;
+    while (fs > 8 && ctx.measureText(lbl).width > pw - 12) { fs--; ctx.font = `600 ${fs}px system-ui, sans-serif`; }
+    ctx.fillText(lbl, x0 + 6, y0 + ph - 4);
+    ctx.restore();
   }
 
   function silhouette(ctx, spot, W, H, hz, r) {
