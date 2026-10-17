@@ -55,7 +55,11 @@
     aod *= 1 + Math.max(0, (ev.rhLow || 60) - 70) / 50;
     const seed = (g.Photoreal ? g.Photoreal.hash : () => 0.5)(spot.id + ":" + ev.tSet);
     const C = cloudsAt(spot, ev, t);
-    return Object.assign({
+    // r8: sky demos (?sky=clear|partly|broken|overcast)
+    const skq = new URLSearchParams(location.search).get("sky");
+    const DEMO = { clear: { high: 0.12, mid: 0, low: 0, block: 0, gap: 1 }, partly: { high: 0.35, mid: 0.3, low: 0.2, block: 0.15, gap: 0.8 },
+      broken: { high: 0.3, mid: 0.75, low: 0.45, block: 0.12, gap: 0.9, midKm: 4 }, overcast: { high: 0.4, mid: 0.95, low: 0.85, block: 1, gap: 0 } }[skq];
+    const P = Object.assign({
       elev: pos.elev, sunAzOff: clamp(off + 3, -14, 14),
       high: C.high, mid: C.mid, low: C.low, midKm: C.midKm, gap: C.gap, cloudSrc: C.src,
       block: clamp(ev.slotBlock || 0), aod: clamp(aod, 0.02, 1.2), rh: (ev.rhLow || 60) / 100,
@@ -67,7 +71,18 @@
       camH: spot.type === "Summit" ? 0.47 : spot.type === "Bluff" ? 0.025 : spot.type === "Dunes" ? 0.03 : 0.0025,
       ...seaP(spot, ev, t),
       seed, wind: seed * 6.283, dog: ev.dog && ev.dog.p >= 15 && pos.elev > 0.3 && pos.elev < 15 ? clamp(ev.dog.p / 60) : 0,
-    }, opt);
+    }, DEMO || {}, opt);
+    // r8: overcast gating — a solid low/mid deck (≥ 90%, mid weighted 0.95) or a blocked light path → flat gray, no glow
+    const cover = Math.max(P.low || 0, 0.95 * (P.mid || 0));
+    P.gray = clamp(Math.max((cover - 0.75) / 0.15, ((P.block || 0) - 0.6) / 0.28));
+    // r8: afterglow regimes — (a) deck with an open horizon toward the sun → under-lit; (b) broken/patchy deck → lit edges and higher clouds
+    const gapH = Math.max(P.gap || 0, 1 - clamp(P.block || 0));
+    const deck = clamp((cover - 0.3) / 0.4), broken = clamp((cover - 0.15) / 0.2) * (1 - clamp((cover - 0.8) / 0.12));
+    const under = deck * clamp((gapH - 0.25) / 0.45), tops = broken * clamp((P.mid || 0) + 0.7 * (P.high || 0) + 0.4 * (P.low || 0));
+    const clearSky = cover < 0.1 && (P.high || 0) < 0.15;
+    P.under = under * (1 - P.gray); P.tops = tops * (1 - P.gray);
+    P.glow = (1 - P.gray) * (clearSky ? 0.95 : 1.05 + 0.15 * under + 0.1 * tops);
+    return P;
   }
 
   function draw(canvas, spot, ev, t, opt = {}) {
@@ -158,4 +173,10 @@
     const f = a || b; return Math.abs(f.t - t) < 150 ? [[f.url, 1]] : null;
   }
   g.PhotoStage = { realistic: REAL, draw, params, cloudsAt, prompt, apiOK, ensurePhotos, photoMix, photoSet, keyTimes, live };
+  // r8: score agrees with the gray render — cap the score when the event hour has a solid low/mid deck or a blocked light path
+  if (g.Model && g.Model.evaluate && !g.Model.__r8) { const base = g.Model.evaluate; g.Model.__r8 = 1;
+    g.Model.evaluate = function () { const ev = base.apply(this, arguments);
+      try { const s = ev.s || {}, cover = Math.max(s.low || 0, 0.95 * (s.mid || 0)) / 100, gy = clamp(Math.max((cover - 0.75) / 0.15, ((ev.slotBlock || 0) - 0.6) / 0.28));
+        if (gy > 0) { const cap = Math.round(ev.score + (12 - ev.score) * gy); if (cap < ev.score) { ev.scoreModel = ev.score; ev.score = cap; } } } catch (e) {}
+      return ev; }; }
 })(window);

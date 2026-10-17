@@ -17,6 +17,8 @@ uniform vec3 uSunA;     // apparent (refracted) sun direction
 uniform vec3 uSunC;     // sun direction for lighting cloud decks: lifted by the refraction a grazing ray picks up along its whole path
 uniform vec3 uCov;      // high, mid, low cloud fraction 0..1
 uniform float uBlock;   // western low-cloud blockage along the sunset line 0..1
+uniform float uGray; uniform float uGlow; uniform float uUnder; uniform float uTops;
+// r8: uGray 1 = sun blocked (flat gray, no direct sun); uGlow/uUnder/uTops = afterglow regimes (under-lit deck / lit tops+edges)
 uniform float uAod;     // aerosol optical depth (550 nm)
 uniform float uRH;      // low-level relative humidity 0..1
 uniform float uExpo;
@@ -202,11 +204,13 @@ vec3 cloudShade(int L, vec3 P, vec3 rd, float t, float pixA, out float alpha){
   float shadow = exp(-tauS) ;
   float ms = .35 * exp(-tauS*.25);          // multiple scattering keeps cores glowing
   vec3 Ts = sunT(P + up*lh.y*.5, sun);
-  float lightIn = L == 2 ? 1. - .55*uBlock : 1. - .9*uBlock*uBlock;
+  float bEff = uBlock * (1. - .6 * uBlockGap);
+  float lightIn = L == 2 ? 1. - .55*bEff : 1. - .9*bEff*bEff;
   float cs = dot(rd, sun);
   float ph = mix(phHG(cs, .65), phHG(cs, -.1), .45) ;
   float fwd = mix(1., .35, clamp(tauV*.25, 0., 1.)); // thick cores block the forward lobe
   vec3 direct = ESUN * Ts * lightIn * (ph*fwd*4.*PI*.12 + .05) * (shadow + ms) ;
+  direct *= uGlow * (1. + uUnder * .6 * (1. - above) * (L < 2 ? 1. : .5) + uTops * (L >= 1 ? .45 : .2));
   // ambient: blue skylight from above + warm horizon light
   vec3 hA = sunT(P + up*2.5, sun), hB = sunT(P + up*12., sun);
   float skyLit = dot(hA, vec3(.25,.45,.3))*.75 + dot(hB, vec3(.25,.45,.3))*.25;
@@ -216,7 +220,7 @@ vec3 cloudShade(int L, vec3 P, vec3 rd, float t, float pixA, out float alpha){
   amb *= mix(L == 0 ? .6 : .8, 1., clamp(dot(Ts, vec3(.33)) * 25., 0., 1.));
   // internal texture: thin edges glow (silver lining), thick cores go darker when back-lit
   float tex = L == 0 ? (.8 + .4*fbm(xz*.08 + 3., fp*.08, 4)) : (.55 + .9*fbm(xz*(L == 1 ? 5. : 1.3) + 17., fp*(L == 1 ? 5. : 1.3), 5));
-  float rim = (1. - smoothstep(.0, .55, d)) * smoothstep(.2, 1., cs) * 2.5;
+  float rim = (1. - smoothstep(.0, .55, d)) * smoothstep(.2, 1., cs) * 2.5 * (1. + .8 * uTops);
   return (direct * (tex + rim) + amb * mix(1., tex, .6)) * (L == 0 ? 1.15 : 1.);
 }
 
@@ -299,7 +303,7 @@ void main(){
   BMe = max(uAod, .01) / HM; BMs = BMe * .9;
   vec3 ro = vec3(0., R0 + uCamH, 0.);
   vec3 col; vec3 T;
-  float sunVis = cloudTowardSun(ro, uSunA);
+  float sunVis = cloudTowardSun(ro, uSunA) * (1. - uGray);
   vec3 sunAtm; { vec3 tmp; skyRay(ro, uSunA, .004, false, tmp); sunAtm = sunT(ro, uSunA); }
 
   // horizon geometry
@@ -445,6 +449,7 @@ void main(){
   if (uMeter > 1.5){ o = vec4(sqrt(clamp(col * uExpo / 4., 0., 1.)), 1.); return; }
   if (uMeter > .5){ float L = max(max(col.r, max(col.g, col.b)) * .8 + dot(col, vec3(.2126,.7152,.0722)) * .2, 1e-6); o = vec4(clamp((log2(L) + 16.) / 24., 0., 1.), 0., 0., 1.); return; }
   col *= uExpo;
+  if (uGray > 0.){ float lg = dot(col, vec3(.2126,.7152,.0722)); col = mix(col, vec3(lg) * vec3(.94, .97, 1.03) * (1. - .25 * uGray), uGray); }
   { float lm = dot(col, vec3(.2126,.7152,.0722)); col = max(mix(vec3(lm), col, 1.3), 0.); }  // film-like colour separation
   // twilight colour response (calibrated against reference sunset photos): long-path warm light reads orange-red/pink
   // on camera rather than yellow, so pull green out of warm tones as the sun sinks
@@ -514,6 +519,7 @@ void main(){
     gl.uniform3fv(U.uSunC, dir(e + lift * d2r));
     gl.uniform3f(U.uCov, P.high, P.mid, P.low);
     gl.uniform1f(U.uBlock, P.block); gl.uniform1f(U.uAod, P.aod); gl.uniform1f(U.uRH, P.rh);
+    if (U.uGray) gl.uniform1f(U.uGray, clamp(P.gray || 0)); if (U.uGlow) gl.uniform1f(U.uGlow, P.glow != null ? P.glow : 1); if (U.uUnder) gl.uniform1f(U.uUnder, P.under || 0); if (U.uTops) gl.uniform1f(U.uTops, P.tops || 0);
 
     gl.uniform1f(U.uWater, P.water ? 1 : 0); gl.uniform1f(U.uPier, P.pier ? 1 : 0); gl.uniform1f(U.uShore, P.shore || 0); gl.uniform1f(U.uHills, P.hills || 0); if (U.uCity) gl.uniform1f(U.uCity, P.city || 0); if (U.uBridge) gl.uniform1f(U.uBridge, P.bridge || 0);
     gl.uniform1f(U.uCamH, P.camH || 0.002);
@@ -521,7 +527,7 @@ void main(){
     gl.uniform1f(U.uFov, vfov * d2r); gl.uniform1f(U.uPitch, (vfov * 0.17) * d2r);
     gl.uniform2f(U.uSeed, P.seed * 977 % 500, P.seed * 613 % 500); gl.uniform1f(U.uWind, P.wind || 0);
     gl.uniform1f(U.uLQ, P.lq ? 1 : 0); gl.uniform1f(U.uDog, P.dog || 0); gl.uniform1f(U.uPixScale, 1);
-    gl.uniform1f(U.uTwi, Math.max(0, Math.min(1, (1.5 - P.elev) / 3)) * Math.max(0, Math.min(1, (P.elev + 8) / 3))); gl.uniform1f(U.uGrainT, P.grain || 0.37);
+    gl.uniform1f(U.uTwi, Math.max(0, Math.min(1, (1.5 - P.elev) / 3)) * Math.max(0, Math.min(1, (P.elev + 8) / 3)) * (1 - clamp(P.gray || 0))); gl.uniform1f(U.uGrainT, P.grain || 0.37);
     gl.uniform1f(U.uBlockGap, P.gap || 0);
     gl.uniform1f(U.uChop, P.chop != null ? P.chop : 0.3); gl.uniform1f(U.uSwell, P.swell || 0); gl.uniform1f(U.uCaps, P.caps || 0); gl.uniform1f(U.uPhase, P.phase || 0);
     gl.uniform1f(U.uMidH, clamp(P.midKm || 4.5, 2.5, 7.5));
